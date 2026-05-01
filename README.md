@@ -214,5 +214,3 @@ After a successful solve the plugin writes to `<output_dir>/geo_register_plugin_
 ## Requirements
 
 - At least **3 matched image–camera pairs** are required to solve the transform.
-- Camera poses must be available in the loaded scene or in a COLMAP / NeRF
-  `transforms.json` file in the dataset folder.
