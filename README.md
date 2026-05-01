@@ -91,10 +91,7 @@ different session or computed externally).
     [-0.0121,  0.9998,  0.0089],
     [ 0.0157, -0.0087,  0.9998]
   ],
-  "translation": [4052845.12, 617312.45, 4867891.78],
-  "rmse_m": 1.190,
-  "n_inliers": 103,
-  "n_total": 104
+  "translation": [4052845.12, 617312.45, 4867891.78]
 }
 ```
 
