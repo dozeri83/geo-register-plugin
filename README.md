@@ -60,8 +60,7 @@ to its camera pose by filename stem, and runs the solver.
 >
 > **If your images have been undistorted, you have two options:**
 >
-> - **Preferred:** Skip undistortion and use the original images directly. Most modern
->   NeRF and Gaussian Splatting pipelines handle lens distortion natively.
+> - **Preferred:** Skip undistortion and use the original images directly. LichtFeld Studio can undistort the images natively.
 >
 > - **Alternative:** Copy the EXIF data from the originals to the undistorted images
 >   using [ExifTool](https://exiftool.org/):
