@@ -246,11 +246,7 @@ class MainPanel(lf.ui.Panel):
 
     def _run_georeg(self, gps_list: list) -> None:
         from lfs_plugins.ui.state import AppState
-        from ..geo.camera_reader import (
-            read_camera_positions_from_scene,
-            read_camera_positions,
-            NoCameraDataError,
-        )
+        from ..geo.camera_reader import read_camera_positions_from_scene
         from ..geo.ecef import geodetic_to_ecef
         from ..geo.transform import robust_umeyama
 
@@ -261,17 +257,11 @@ class MainPanel(lf.ui.Panel):
             return
 
         cameras = read_camera_positions_from_scene(scene)
-        if cameras:
-            lf.log.info(f"geo_register: {len(cameras)} camera pose(s) read from scene.")
-        else:
-            lf.log.info("geo_register: no camera nodes in scene, falling back to dataset files ...")
-            try:
-                cameras = read_camera_positions(scene_path)
-            except (NoCameraDataError, FileNotFoundError) as exc:
-                self._set_status(str(exc), error=True)
-                lf.log.warn(f"geo_register: {exc}")
-                return
-            lf.log.info(f"geo_register: {len(cameras)} camera pose(s) read from file.")
+        if not cameras:
+            self._set_status("No camera nodes found in the scene. Load a dataset first.", error=True)
+            lf.log.warn("geo_register: no camera nodes in scene.")
+            return
+        lf.log.info(f"geo_register: {len(cameras)} camera pose(s) read from scene.")
 
         src_pts: list = []
         dst_pts: list = []

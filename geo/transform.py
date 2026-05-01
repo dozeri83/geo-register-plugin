@@ -82,7 +82,7 @@ def ransac_umeyama(
     src: list,
     dst: list,
     *,
-    inlier_thr: float = 5.0,
+    inlier_thr: float = 10.0,
     confidence: float = 0.99,
     max_iter: int = 2000,
     min_sample: int = 3,
@@ -210,7 +210,7 @@ def robust_umeyama(
     src: list,
     dst: list,
     *,
-    inlier_thr: float = 5.0,
+    inlier_thr: float = 10.0,
     confidence: float = 0.99,
     max_ransac_iter: int = 2000,
     huber_delta: float = 2.0,
@@ -223,9 +223,14 @@ def robust_umeyama(
     Returns the IRLS result dict plus RANSAC bookkeeping keys:
       inlier_mask, n_inliers, n_total.
     """
-    # Stage 1 – RANSAC
+    # Centre dst to improve SVD conditioning (ECEF values ~1e6 m).
+    # Residuals are shift-invariant so thresholds need no adjustment.
+    dst_center = np.mean(np.array(dst, dtype=float), axis=0)
+    dst_c = (np.array(dst, dtype=float) - dst_center).tolist()
+
+    # Stage 1 – RANSAC on centred coordinates
     ransac_result = ransac_umeyama(
-        src, dst,
+        src, dst_c,
         inlier_thr=inlier_thr,
         confidence=confidence,
         max_iter=max_ransac_iter,
@@ -235,15 +240,18 @@ def robust_umeyama(
     n_inliers: int          = ransac_result["n_inliers"]
     n_total: int            = ransac_result["n_total"]
 
-    inlier_src = [s for s, m in zip(src, inlier_mask) if m]
-    inlier_dst = [d for d, m in zip(dst, inlier_mask) if m]
+    inlier_src = [s for s, m in zip(src,   inlier_mask) if m]
+    inlier_dst = [d for d, m in zip(dst_c, inlier_mask) if m]
 
-    # Stage 2 – IRLS on inliers
+    # Stage 2 – IRLS on centred inliers
     irls_result = irls_umeyama(
         inlier_src, inlier_dst,
         huber_delta=huber_delta,
         max_iter=max_irls_iter,
     )
+
+    # Restore true translation: t_true = t_centred + dst_center
+    irls_result["t"] = (np.array(irls_result["t"]) + dst_center).tolist()
 
     # Propagate RANSAC metadata
     irls_result["inlier_mask"] = inlier_mask
