@@ -27,8 +27,8 @@ class MainPanel(lf.ui.Panel):
     space = lf.ui.PanelSpace.MAIN_PANEL_TAB
     order = 50
 
-    _MODES     = ["EXIF", "Matrix File"]
-    _MODE_KEYS = ["exif", "matrix"]
+    _MODES     = ["EXIF", "Similarity File", "Image Positions CSV"]
+    _MODE_KEYS = ["exif", "similarity", "csv"]
 
     def __init__(self):
         self._mode_idx: int           = 0
@@ -79,8 +79,10 @@ class MainPanel(lf.ui.Panel):
 
         if self._mode == "exif":
             self._draw_exif_section(layout, scale, theme)
+        elif self._mode == "similarity":
+            self._draw_similarity_section(layout, scale, theme)
         else:
-            self._draw_matrix_section(layout, theme)
+            self._draw_csv_section(layout, scale, theme)
 
         # Status line
         if self._status:
@@ -104,8 +106,15 @@ class MainPanel(lf.ui.Panel):
         if layout.button_styled("Calc Georeference From EXIF", "primary", (-1, 32 * scale)):
             self._run_exif()
 
-    def _draw_matrix_section(self, layout, theme):
-        layout.text_colored("Similarity matrix file import -- coming soon.", theme.palette.text_dim)
+    def _draw_similarity_section(self, layout, scale, theme):
+        layout.text_colored(
+            "Load a similarity transform JSON file\n"
+            "to register the scene to ECEF coordinates.",
+            theme.palette.text_dim,
+        )
+        layout.spacing()
+        if layout.button_styled("Load Similarity File", "primary", (-1, 32 * scale)):
+            self._load_similarity_file()
 
     def _draw_transform_section(self, layout, scale, theme):
         t     = self._transform
@@ -206,28 +215,19 @@ class MainPanel(lf.ui.Panel):
     def _run_exif(self):
         from lfs_plugins.ui.state import AppState
         from ..geo.exif_reader import find_images_with_gps, NoGPSDataError
-        from ..geo.camera_reader import (
-            read_camera_positions_from_scene,
-            read_camera_positions,
-            NoCameraDataError,
-        )
-        from ..geo.ecef import geodetic_to_ecef
-        from ..geo.transform import robust_umeyama
 
         self._transform = None
         self._lla = None
         self._clear_point()
 
         scene_path = AppState.scene_path.value
-        scene = lf.get_scene()
-        if not scene_path or scene is None:
+        if not scene_path or lf.get_scene() is None:
             self._set_status("No scene is currently loaded.", error=True)
             return
 
         lf.log.info(f"geo_register: scanning '{scene_path}' for GPS EXIF ...")
-
         try:
-            gps_list = find_images_with_gps(scene_path)
+            raw = find_images_with_gps(scene_path)
         except NoGPSDataError as exc:
             self._set_status(str(exc), error=True)
             lf.log.warn(f"geo_register: {exc}")
@@ -237,7 +237,28 @@ class MainPanel(lf.ui.Panel):
             lf.log.error(f"geo_register: {exc}")
             return
 
-        lf.log.info(f"geo_register: GPS found in {len(gps_list)} image(s).")
+        lf.log.info(f"geo_register: GPS found in {len(raw)} image(s).")
+        gps_list = [
+            {"name": Path(e["path"]).name, "lat": e["lat"], "lon": e["lon"], "alt": e["alt"]}
+            for e in raw
+        ]
+        self._run_georeg(gps_list)
+
+    def _run_georeg(self, gps_list: list) -> None:
+        from lfs_plugins.ui.state import AppState
+        from ..geo.camera_reader import (
+            read_camera_positions_from_scene,
+            read_camera_positions,
+            NoCameraDataError,
+        )
+        from ..geo.ecef import geodetic_to_ecef
+        from ..geo.transform import robust_umeyama
+
+        scene_path = AppState.scene_path.value
+        scene = lf.get_scene()
+        if not scene_path or scene is None:
+            self._set_status("No scene is currently loaded.", error=True)
+            return
 
         cameras = read_camera_positions_from_scene(scene)
         if cameras:
@@ -254,11 +275,13 @@ class MainPanel(lf.ui.Panel):
 
         src_pts: list = []
         dst_pts: list = []
+        matched_gps: list = []
         for entry in gps_list:
-            name = Path(entry["path"]).name
+            name = entry["name"]
             if name in cameras:
                 src_pts.append(cameras[name])
                 dst_pts.append(geodetic_to_ecef(entry["lat"], entry["lon"], entry["alt"]))
+                matched_gps.append(entry)
 
         if len(src_pts) < 3:
             msg = (
@@ -271,7 +294,6 @@ class MainPanel(lf.ui.Panel):
             return
 
         lf.log.info(f"geo_register: {len(src_pts)} correspondences - running RANSAC+IRLS ...")
-
         try:
             result = robust_umeyama(src_pts, dst_pts)
         except Exception as exc:
@@ -280,18 +302,169 @@ class MainPanel(lf.ui.Panel):
             return
 
         self._transform = result
+        saved_json, saved_csv = self._save_transform(result, scene_path, matched_gps)
         n_in  = result.get("n_inliers", result["n"])
         n_tot = result.get("n_total",   result["n"])
-        self._set_status(
-            f"Ready -- {n_in}/{n_tot} inliers, RMSE {result['rmse']:.3f} m",
-            error=False,
-        )
+        status = f"Ready -- {n_in}/{n_tot} inliers, RMSE {result['rmse']:.3f} m"
+        if saved_json:
+            status += f" | Saved: {saved_json}"
+        if saved_csv:
+            status += f" | CSV: {saved_csv}"
+        self._set_status(status, error=False)
         lf.log.info(
             f"geo_register: inliers={n_in}/{n_tot}  "
             f"scale={result['s']:.6f}  RMSE={result['rmse']:.3f} m"
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _draw_csv_section(self, layout, scale, theme):
+        layout.text_colored(
+            "Load an image positions CSV file\n"
+            "(columns: image_name, lat, lon, alt).",
+            theme.palette.text_dim,
+        )
+        layout.spacing()
+        if layout.button_styled("Load CSV File", "primary", (-1, 32 * scale)):
+            self._load_csv_file()
+
+    def _load_csv_file(self) -> None:
+        import csv
+
+        path = lf.ui.open_csv_file_dialog()
+        if not path:
+            return
+
+        self._transform = None
+        self._lla = None
+        self._clear_point()
+
+        try:
+            gps_list = []
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    gps_list.append({
+                        "name": row["image_name"],
+                        "lat":  float(row["lat"]),
+                        "lon":  float(row["lon"]),
+                        "alt":  float(row["alt"]),
+                    })
+        except Exception as exc:
+            self._set_status(f"Failed to parse CSV: {exc}", error=True)
+            lf.log.error(f"geo_register: {exc}")
+            return
+
+        lf.log.info(f"geo_register: loaded {len(gps_list)} image positions from '{path}'")
+        self._run_georeg(gps_list)
+
+    def _load_similarity_file(self) -> None:
+        import json
+        import shutil
+
+        path = lf.ui.open_json_file_dialog()
+        if not path:
+            return
+
+        self._transform = None
+        self._lla = None
+        self._clear_point()
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            for key in ("scale", "rotation", "translation"):
+                if key not in data:
+                    self._set_status(f"Invalid similarity file: missing '{key}'", error=True)
+                    lf.log.error(f"geo_register: similarity file missing key '{key}'")
+                    return
+
+            n = data.get("n_total", data.get("n_inliers", 0))
+            self._transform = {
+                "s":        data["scale"],
+                "R":        data["rotation"],
+                "t":        data["translation"],
+                "rmse":     data.get("rmse_m", 0.0),
+                "n":        n,
+                "n_inliers": data.get("n_inliers", n),
+                "n_total":   data.get("n_total",   n),
+            }
+
+            # Copy to output dir if the file is not already there
+            copied_to = None
+            output_path = lf.dataset_params().output_path
+            if output_path:
+                expected_dir = Path(output_path) / "geo_register_plugin_data"
+                src = Path(path)
+                if src.parent.resolve() != expected_dir.resolve():
+                    expected_dir.mkdir(parents=True, exist_ok=True)
+                    dst = expected_dir / src.name
+                    shutil.copy2(str(src), str(dst))
+                    copied_to = dst
+                    lf.log.info(f"geo_register: copied similarity file to '{dst}'")
+
+            status = f"Loaded: {Path(path).name}"
+            if copied_to:
+                status += f" | Copied to: {copied_to}"
+            self._set_status(status, error=False)
+            lf.log.info(f"geo_register: loaded similarity transform from '{path}'")
+
+        except Exception as exc:
+            self._set_status(f"Failed to load file: {exc}", error=True)
+            lf.log.error(f"geo_register: {exc}")
+
+    def _save_transform(self, result: dict, scene_path: str, matched_gps: list | None = None) -> tuple:
+        import json
+        import csv
+
+        output_path = lf.dataset_params().output_path
+        base = Path(output_path) if output_path else Path(scene_path)
+        out_dir = base / "geo_register_plugin_data"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "scale": result["s"],
+            "rotation": result["R"],
+            "translation": result["t"],
+            "rmse_m": result["rmse"],
+            "n_inliers": result.get("n_inliers", result["n"]),
+            "n_total": result.get("n_total", result["n"]),
+        }
+
+        out_file = out_dir / "similarity_transform.json"
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        saved_csv = None
+        if matched_gps:
+            csv_file = out_dir / "image_positions.csv"
+            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["image_name", "lat", "lon", "alt"])
+                for row in matched_gps:
+                    writer.writerow([row["name"], row["lat"], row["lon"], row["alt"]])
+            saved_csv = str(csv_file)
+            lf.log.info(f"geo_register: image positions saved to '{csv_file}'")
+
+        info_file = out_dir / "similarity_transform_info.txt"
+        with open(info_file, "w", encoding="utf-8") as f:
+            f.write("Similarity Transform\n")
+            f.write("====================\n\n")
+            f.write("Formula: world_ecef = scale * R @ p_scene + translation\n\n")
+            f.write("Fields:\n")
+            f.write("  scale       - uniform scale factor\n")
+            f.write("  rotation    - 3x3 rotation matrix (row-major)\n")
+            f.write("  translation - 3D translation vector in metres\n")
+            f.write("  rmse_m      - root mean square error of the fit in metres\n\n")
+            f.write("Order of operations:\n")
+            f.write("  1. Multiply scene point by scale\n")
+            f.write("  2. Apply rotation R\n")
+            f.write("  3. Add translation\n\n")
+            f.write("The result is an ECEF (Earth-Centered Earth-Fixed) coordinate in metres.\n")
+
+        lf.log.info(f"geo_register: transform saved to '{out_file}'")
+        return str(out_file), saved_csv
 
     def _set_status(self, message: str, *, error: bool) -> None:
         self._status          = message
