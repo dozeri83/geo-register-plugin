@@ -43,7 +43,16 @@ matches them to the camera poses in the loaded scene, and solves the transform.
 3. Click **Calc Georeference From EXIF**.
 
 The plugin scans the dataset folder for images with GPS EXIF tags, matches each image
-to its camera pose by filename, and runs the solver.
+to its camera pose by filename stem, and runs the solver.
+
+> **Original images folder:**
+> If your dataset images no longer contain GPS EXIF data (e.g. they were undistorted
+> or re-encoded), click **Set Original Images Folder** to point the plugin at the
+> folder containing your original images. The plugin will scan that folder for GPS
+> tags instead.
+> The filename **stem** (name without extension) must match between the original
+> images and the dataset cameras — for example, `DJI_0001.jpg` (original) matches
+> `DJI_0001.JPG` or `DJI_0001.png` in the dataset.
 
 > **Note on undistorted images:**
 > Tools like RealityCapture, RealityScan, and COLMAP often undistort or re-encode images
