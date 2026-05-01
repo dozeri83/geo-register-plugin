@@ -127,7 +127,7 @@ drone flight controller, or sourced from a ground control point log).
 The file must have a header row with exactly these column names:
 
 ```
-image_name,lat,lon,alt
+#image_name,lat,lon,alt
 DJI_0001.JPG,32.08154321,34.78912345,48.250
 DJI_0002.JPG,32.08163897,34.78924561,48.431
 DJI_0003.JPG,32.08172450,34.78937812,48.619
@@ -141,6 +141,53 @@ DJI_0004.JPG,32.08181023,34.78951034,48.802
 
 The plugin exports this CSV automatically after every EXIF solve, to
 `<output_dir>/geo_register_plugin_data/image_positions.csv`.
+
+---
+
+### 4. RealityScan Parameters CSV
+
+> **Recommended over EXIF when you aligned your data with RealityScan.**
+>
+> RealityScan performs bundle adjustment that refines each camera's position beyond
+> the raw GPS reading. Importing these adjusted positions instead of raw EXIF gives
+> significantly better geo-registration accuracy, because the plugin fits the
+> similarity transform to coordinates that are already internally consistent with
+> the reconstructed model. Expect a noticeably lower RMSE compared to EXIF mode.
+
+**How to export from RealityScan:**
+
+**Step 1 — Set the project output coordinate system to WGS 84:**
+
+Go to **Workflow → Settings → Coordinate System** and set the output coordinate
+system to **EPSG:4326 – GPS WGS 84**.
+
+![RealityScan project coordinate system setting](assets/rs_project_setting.png)
+
+**Step 2 — Export Internal/External Camera Parameters:**
+
+In the export dialog, choose **Internal/External Camera Parameters**.
+In the export settings, set the coordinate system to **Project Output**.
+
+![RealityScan export settings](assets/rs_export_settings.png)
+
+**Step 3 — Load in the plugin:**
+
+1. Select **RealityScan Parameters CSV** from the Source dropdown.
+2. Click **Load RealityScan CSV** and pick the exported `.csv` file.
+
+**CSV format (exported by RealityScan):**
+
+```
+#name,x,y,alt,yaw,pitch,roll,f_35mm,px_norm,py_norm,k1,k2,k3,k4,t1,t2
+DJI_0214.JPG,-34.82878738,7.16331052,86.94,131.99,...
+```
+
+- `name` — image filename
+- `x` — longitude (decimal degrees, WGS-84)
+- `y` — latitude (decimal degrees, WGS-84)
+- `alt` — ellipsoidal altitude in metres
+
+All other columns (yaw, pitch, roll, lens parameters) are ignored by the plugin.
 
 ---
 

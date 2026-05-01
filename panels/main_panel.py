@@ -27,8 +27,8 @@ class MainPanel(lf.ui.Panel):
     space = lf.ui.PanelSpace.MAIN_PANEL_TAB
     order = 50
 
-    _MODES     = ["EXIF", "Similarity File", "Image Positions CSV"]
-    _MODE_KEYS = ["exif", "similarity", "csv"]
+    _MODES     = ["EXIF", "Similarity File", "Image Positions CSV", "RealityScan Parameters CSV"]
+    _MODE_KEYS = ["exif", "similarity", "csv", "rs_csv"]
 
     def __init__(self):
         self._mode_idx: int                  = 0
@@ -83,8 +83,10 @@ class MainPanel(lf.ui.Panel):
             self._draw_exif_section(layout, scale, theme)
         elif self._mode == "similarity":
             self._draw_similarity_section(layout, scale, theme)
-        else:
+        elif self._mode == "csv":
             self._draw_csv_section(layout, scale, theme)
+        else:
+            self._draw_rs_csv_section(layout, scale, theme)
 
         # Status line
         if self._status:
@@ -353,20 +355,71 @@ class MainPanel(lf.ui.Panel):
         try:
             gps_list = []
             with open(path, "r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    gps_list.append({
-                        "name": Path(row["image_name"]).stem,
-                        "lat":  float(row["lat"]),
-                        "lon":  float(row["lon"]),
-                        "alt":  float(row["alt"]),
-                    })
+                lines = f.read().splitlines()
+            # Strip leading # from header line if present
+            if lines and lines[0].startswith("#"):
+                lines[0] = lines[0].lstrip("#").strip()
+            import io
+            reader = csv.DictReader(io.StringIO("\n".join(lines)))
+            for row in reader:
+                gps_list.append({
+                    "name": Path(row["image_name"]).stem,
+                    "lat":  float(row["lat"]),
+                    "lon":  float(row["lon"]),
+                    "alt":  float(row["alt"]),
+                })
         except Exception as exc:
             self._set_status(f"Failed to parse CSV: {exc}", error=True)
             lf.log.error(f"geo_register: {exc}")
             return
 
         lf.log.info(f"geo_register: loaded {len(gps_list)} image positions from '{path}'")
+        self._run_georeg(gps_list)
+
+    def _draw_rs_csv_section(self, layout, scale, theme):
+        layout.text_colored(
+            "Load a RealityScan Internal/External\n"
+            "Camera Parameters CSV file\n"
+            "(columns: name, x=lon, y=lat, alt, ...).",
+            theme.palette.text_dim,
+        )
+        layout.spacing()
+        if layout.button_styled("Load RealityScan CSV", "primary", (-1, 32 * scale)):
+            self._load_rs_csv_file()
+
+    def _load_rs_csv_file(self) -> None:
+        import csv
+        import io
+
+        path = lf.ui.open_csv_file_dialog()
+        if not path:
+            return
+
+        self._transform = None
+        self._lla = None
+        self._clear_point()
+
+        try:
+            gps_list = []
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                lines = f.read().splitlines()
+            # Strip leading # from header line if present
+            if lines and lines[0].startswith("#"):
+                lines[0] = lines[0].lstrip("#").strip()
+            reader = csv.DictReader(io.StringIO("\n".join(lines)))
+            for row in reader:
+                gps_list.append({
+                    "name": Path(row["name"]).stem,
+                    "lat":  float(row["y"]),   # RealityScan: y = latitude
+                    "lon":  float(row["x"]),   # RealityScan: x = longitude
+                    "alt":  float(row["alt"]),
+                })
+        except Exception as exc:
+            self._set_status(f"Failed to parse RealityScan CSV: {exc}", error=True)
+            lf.log.error(f"geo_register: {exc}")
+            return
+
+        lf.log.info(f"geo_register: loaded {len(gps_list)} RealityScan positions from '{path}'")
         self._run_georeg(gps_list)
 
     def _load_similarity_file(self) -> None:
@@ -452,7 +505,7 @@ class MainPanel(lf.ui.Panel):
             csv_file = out_dir / "image_positions.csv"
             with open(csv_file, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["image_name", "lat", "lon", "alt"])
+                writer.writerow(["#image_name", "lat", "lon", "alt"])
                 for row in matched_gps:
                     writer.writerow([row["name"], row["lat"], row["lon"], row["alt"]])
             saved_csv = str(csv_file)
