@@ -27,7 +27,7 @@ def read_camera_positions_from_scene(scene) -> dict[str, tuple[float, float, flo
         C = -(R.T @ T)                                  # camera centre, raw dataset world
 
         # Convert raw dataset world (Y-down, Z-forward) → visualizer world (Y-up, Z-backward)
-        name = Path(img_path).name
-        cameras[name] = (float(C[0]), float(-C[1]), float(-C[2]))
+        stem = Path(img_path).stem
+        cameras[stem] = (float(C[0]), float(-C[1]), float(-C[2]))
 
     return cameras

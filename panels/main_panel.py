@@ -31,13 +31,14 @@ class MainPanel(lf.ui.Panel):
     _MODE_KEYS = ["exif", "similarity", "csv"]
 
     def __init__(self):
-        self._mode_idx: int           = 0
-        self._status: str             = ""
-        self._status_is_error         = False
-        self._transform: dict | None  = None
-        self._picking: bool           = False
-        self._lla: tuple | None       = None   # (lat, lon, alt) from last pick
-        self._world_pos: tuple | None = None   # local 3-D position of last pick
+        self._mode_idx: int                  = 0
+        self._status: str                    = ""
+        self._status_is_error                = False
+        self._transform: dict | None         = None
+        self._picking: bool                  = False
+        self._lla: tuple | None              = None   # (lat, lon, alt) from last pick
+        self._world_pos: tuple | None        = None   # local 3-D position of last pick
+        self._orig_images_folder: str | None = None   # override folder for EXIF scan
 
     @property
     def _mode(self) -> str:
@@ -50,11 +51,12 @@ class MainPanel(lf.ui.Panel):
             from ..operators.geo_picker import clear_pick_callback
             clear_pick_callback()
             lf.ui.ops.cancel_modal()
-        self._mode_idx         = 0
-        self._status           = ""
-        self._status_is_error  = False
-        self._transform        = None
-        self._picking          = False
+        self._mode_idx            = 0
+        self._status              = ""
+        self._status_is_error     = False
+        self._transform           = None
+        self._picking             = False
+        self._orig_images_folder  = None
         self._clear_point()
 
     # ── Draw ──────────────────────────────────────────────────────────────────
@@ -102,6 +104,17 @@ class MainPanel(lf.ui.Panel):
             "similarity transform to ECEF (WGS-84).",
             theme.palette.text_dim,
         )
+        layout.spacing()
+
+        if self._orig_images_folder:
+            layout.text_colored(self._orig_images_folder, theme.palette.text_dim)
+            if layout.button_styled("Change Original Images Folder", "warning", (-1, 28 * scale)):
+                self._pick_orig_images_folder()
+        else:
+            layout.text_colored("Images: dataset folder (default)", theme.palette.text_dim)
+            if layout.button_styled("Set Original Images Folder", "warning", (-1, 28 * scale)):
+                self._pick_orig_images_folder()
+
         layout.spacing()
         if layout.button_styled("Calc Georeference From EXIF", "primary", (-1, 32 * scale)):
             self._run_exif()
@@ -210,6 +223,13 @@ class MainPanel(lf.ui.Panel):
         lf.ui.set_clipboard_text(text)
         lf.log.info(f"geo_register: copied to clipboard: {text}")
 
+    def _pick_orig_images_folder(self):
+        folder = lf.ui.open_folder_dialog(title="Select Original Images Folder")
+        if folder:
+            self._orig_images_folder = folder
+            lf.log.info(f"geo_register: original images folder set to '{folder}'")
+            lf.ui.request_redraw()
+
     # ── Georeference pipeline ─────────────────────────────────────────────────
 
     def _run_exif(self):
@@ -225,9 +245,10 @@ class MainPanel(lf.ui.Panel):
             self._set_status("No scene is currently loaded.", error=True)
             return
 
-        lf.log.info(f"geo_register: scanning '{scene_path}' for GPS EXIF ...")
+        scan_folder = self._orig_images_folder or scene_path
+        lf.log.info(f"geo_register: scanning '{scan_folder}' for GPS EXIF ...")
         try:
-            raw = find_images_with_gps(scene_path)
+            raw = find_images_with_gps(scan_folder)
         except NoGPSDataError as exc:
             self._set_status(str(exc), error=True)
             lf.log.warn(f"geo_register: {exc}")
@@ -239,7 +260,7 @@ class MainPanel(lf.ui.Panel):
 
         lf.log.info(f"geo_register: GPS found in {len(raw)} image(s).")
         gps_list = [
-            {"name": Path(e["path"]).name, "lat": e["lat"], "lon": e["lon"], "alt": e["alt"]}
+            {"name": Path(e["path"]).stem, "lat": e["lat"], "lon": e["lon"], "alt": e["alt"]}
             for e in raw
         ]
         self._run_georeg(gps_list)
@@ -335,7 +356,7 @@ class MainPanel(lf.ui.Panel):
                 reader = csv.DictReader(f)
                 for row in reader:
                     gps_list.append({
-                        "name": row["image_name"],
+                        "name": Path(row["image_name"]).stem,
                         "lat":  float(row["lat"]),
                         "lon":  float(row["lon"]),
                         "alt":  float(row["alt"]),
