@@ -247,7 +247,17 @@ class MainPanel(lf.ui.Panel):
             self._set_status("No scene is currently loaded.", error=True)
             return
 
-        scan_folder = self._orig_images_folder or scene_path
+        if self._orig_images_folder:
+            scan_folder = self._orig_images_folder
+        else:
+            params = lf.dataset_params()
+            data_path = params.data_path if params else None
+            images_sub = (params.images if params else None) or ""
+            if data_path:
+                from pathlib import Path
+                scan_folder = str(Path(data_path) / images_sub) if images_sub else data_path
+            else:
+                scan_folder = scene_path
         lf.log.info(f"geo_register: scanning '{scan_folder}' for GPS EXIF ...")
         try:
             raw = find_images_with_gps(scan_folder)
