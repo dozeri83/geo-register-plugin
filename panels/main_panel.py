@@ -254,7 +254,6 @@ class MainPanel(lf.ui.Panel):
             data_path = params.data_path if params else None
             images_sub = (params.images if params else None) or ""
             if data_path:
-                from pathlib import Path
                 scan_folder = str(Path(data_path) / images_sub) if images_sub else data_path
             else:
                 scan_folder = scene_path
