@@ -208,6 +208,43 @@ After a successful solve the plugin writes to `<output_dir>/geo_register_plugin_
 
 ---
 
+## Export
+
+Once geo-registration is complete, the plugin can export any splat model visible in the
+scene as a geo-referenced point cloud file.
+
+The export section appears at the bottom of the panel. Use the **Splat Model** dropdown
+to select which model to export, choose the output format, then click **Export LAS/LAZ**.
+A save dialog opens with the splat name pre-filled as the filename. The last exported
+path is shown in the panel for reference.
+
+### LAS — LASer file format
+
+LAS is the industry-standard binary format for point cloud data, maintained by the
+[ASPRS](https://www.asprs.org/divisions-committees/lidar-division/laser-las-file-format-exchange-activities).
+The plugin writes **LAS 1.4, point format 7** (XYZ + RGB colour).
+
+- Coordinates are stored in **EPSG:4326** (WGS-84 geographic): X = longitude, Y = latitude, Z = ellipsoidal height in metres.
+- An **OGC WKT CRS record** is embedded in the file header so any compliant GIS tool
+  (QGIS, ArcGIS, CloudCompare, etc.) can read the coordinate system automatically.
+- Gaussian splat positions are transformed from scene space to ECEF using the solved
+  similarity transform, then converted to WGS-84 geodetic coordinates.
+- Colour is taken from the first spherical harmonics band (DC term), packed as
+  16-bit per channel RGB.
+
+### LAZ — Compressed LAS
+
+LAZ is a losslessly compressed variant of LAS. The point data and CRS metadata are
+identical to LAS; only the storage is compressed using the
+[LASzip](https://laszip.org/) algorithm.
+
+- File sizes are typically **5–10× smaller** than the equivalent LAS file.
+- All major GIS tools that support LAS also support LAZ.
+- Requires the `lazrs` or `laszip` Python package in the plugin environment
+  (installed automatically with the plugin dependencies).
+
+---
+
 ## Requirements
 
 - At least **3 matched image–camera pairs** are required to solve the transform.

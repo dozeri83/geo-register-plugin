@@ -6,6 +6,7 @@ authors = [{name = "LichtFeld User"}]
 dependencies = [
     "Pillow>=10.0",
     "numpy>=1.26",
+    "laspy>=2.0",
 ]
 
 [tool.lichtfeld]

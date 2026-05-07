@@ -39,6 +39,12 @@ class MainPanel(lf.ui.Panel):
         self._lla: tuple | None              = None   # (lat, lon, alt) from last pick
         self._world_pos: tuple | None        = None   # local 3-D position of last pick
         self._orig_images_folder: str | None = None   # override folder for EXIF scan
+        self._export_splat_idx: int           = 0
+        self._export_format_idx: int         = 0      # 0=LAS, 1=LAZ
+        self._export_output_path: str | None = None
+        self._export_progress: float | None  = None   # None=idle, 0-1=running
+        self._export_error: str | None       = None
+        self._export_success: str | None     = None
 
     @property
     def _mode(self) -> str:
@@ -57,7 +63,15 @@ class MainPanel(lf.ui.Panel):
         self._transform           = None
         self._picking             = False
         self._orig_images_folder  = None
+        self._export_splat_idx    = 0
+        self._export_format_idx   = 0
+        self._export_output_path  = None
+        self._export_progress     = None
+        self._export_error        = None
+        self._export_success      = None
         self._clear_point()
+        if doc is not None:
+            self._detect_existing_registration()
 
     # ── Draw ──────────────────────────────────────────────────────────────────
 
@@ -98,6 +112,7 @@ class MainPanel(lf.ui.Panel):
         # Transform result + pick section
         if self._transform is not None:
             self._draw_transform_section(layout, scale, theme)
+            self._draw_export_section(layout, scale, theme)
 
     def _draw_exif_section(self, layout, scale, theme):
         layout.text_colored(
@@ -538,6 +553,158 @@ class MainPanel(lf.ui.Panel):
 
         lf.log.info(f"geo_register: transform saved to '{out_file}'")
         return str(out_file), saved_csv
+
+    def _draw_export_section(self, layout, scale, theme) -> None:
+        layout.separator()
+        layout.label("Export")
+        layout.separator()
+        layout.label("Export LAS/LAZ File")
+
+        splat_names = self._get_splat_names()
+        layout.label("Splat Model:")
+        if splat_names:
+            if self._export_splat_idx >= len(splat_names):
+                self._export_splat_idx = 0
+            changed, new_idx = layout.combo("##export_splat", self._export_splat_idx, splat_names)
+            if changed:
+                self._export_splat_idx = new_idx
+        else:
+            layout.text_colored("No splat models found in scene.", theme.palette.text_dim)
+
+        layout.label("Format:")
+        fmt_changed, fmt_idx = layout.combo("##export_format", self._export_format_idx, ["LAS", "LAZ"])
+        if fmt_changed:
+            self._export_format_idx = fmt_idx
+
+        if self._export_output_path:
+            layout.spacing()
+            layout.text_colored(self._export_output_path, theme.palette.text_dim)
+
+        layout.spacing()
+        if self._export_progress is not None:
+            pct = int(self._export_progress * 100)
+            layout.progress_bar(self._export_progress, overlay=f"Exporting... {pct}%",
+                                width=-1, height=24 * scale)
+        else:
+            if self._export_error:
+                layout.text_colored(f"[!] {self._export_error}", (1.0, 0.4, 0.4, 1.0))
+            if self._export_success:
+                layout.text_colored(self._export_success, (0.3, 1.0, 0.3, 1.0))
+            if splat_names:
+                if layout.button_styled("Export LAS/LAZ##export_las_btn", "primary", (-1, 32 * scale)):
+                    splat_name = splat_names[self._export_splat_idx]
+                    if self._export_format_idx == 1:
+                        save_fn = getattr(lf.ui, "save_laz_file_dialog", None)
+                        if save_fn:
+                            path = save_fn(default_name=splat_name)
+                        else:
+                            path = lf.ui.save_las_file_dialog(default_name=splat_name)
+                            if path:
+                                path = str(Path(path).with_suffix(".laz"))
+                    else:
+                        path = lf.ui.save_las_file_dialog(default_name=splat_name)
+                    if path:
+                        self._export_output_path = path
+                        self._start_export_las(path)
+                        lf.ui.request_redraw()
+            else:
+                layout.text_colored("No splat models found in scene.", theme.palette.text_dim)
+
+    def _get_splat_names(self) -> list[str]:
+        import lichtfeld.scene as lf_scene
+
+        scene = lf.get_scene()
+        if scene is None:
+            return []
+        return [
+            node.name if node.name else f"Splat #{node.id}"
+            for node in scene.get_nodes(type=lf_scene.NodeType.SPLAT)
+        ]
+
+    def _start_export_las(self, output_path: str) -> None:
+        import threading
+        import lichtfeld.scene as lf_scene
+
+        scene = lf.get_scene()
+        if scene is None:
+            self._export_error = "No scene loaded."
+            return
+
+        nodes = scene.get_nodes(type=lf_scene.NodeType.SPLAT)
+        if self._export_splat_idx >= len(nodes):
+            self._export_error = "Selected splat model not found."
+            return
+
+        node = nodes[self._export_splat_idx]
+
+        self._export_progress = 0.0
+        self._export_error    = None
+        self._export_success  = None
+        lf.ui.request_redraw()
+
+        threading.Thread(
+            target=self._export_las_worker,
+            args=(node, dict(self._transform), output_path),
+            daemon=True,
+        ).start()
+
+    def _export_las_worker(self, node, transform: dict, output_path: str) -> None:
+        try:
+            from ..geo.las_exporter import export_las
+            export_las(node, transform, output_path, progress_cb=self._on_export_progress)
+            lf.log.info(f"geo_register: LAS exported to '{output_path}'")
+            self._export_success = f"Export succeeded: {Path(output_path).name}"
+        except Exception as exc:
+            self._export_error = str(exc)
+            lf.log.error(f"geo_register: LAS export failed: {exc}")
+        finally:
+            self._export_progress = None
+            lf.ui.request_redraw()
+
+    def _on_export_progress(self, fraction: float) -> None:
+        self._export_progress = fraction
+        lf.ui.request_redraw()
+
+    def _detect_existing_registration(self) -> None:
+        import json
+        from lfs_plugins.ui.state import AppState
+
+        scene_path = AppState.scene_path.value
+        if not scene_path:
+            return
+
+        params = lf.dataset_params()
+        output_path = params.output_path if params else None
+        base = Path(output_path) if output_path else Path(scene_path)
+        candidate = base / "geo_register_plugin_data" / "similarity_transform.json"
+
+        if not candidate.exists():
+            return
+
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            for key in ("scale", "rotation", "translation"):
+                if key not in data:
+                    return
+
+            n = data.get("n_total", data.get("n_inliers", 0))
+            self._transform = {
+                "s":         data["scale"],
+                "R":         data["rotation"],
+                "t":         data["translation"],
+                "rmse":      data.get("rmse_m", 0.0),
+                "n":         n,
+                "n_inliers": data.get("n_inliers", n),
+                "n_total":   data.get("n_total",   n),
+            }
+            msg = "Detected pre existing registration"
+            self._set_status(msg, error=False)
+            lf.log.info(f"geo_register: {msg} from '{candidate}'")
+
+        except Exception as exc:
+            lf.log.warn(f"geo_register: failed to load existing transform: {exc}")
 
     def _set_status(self, message: str, *, error: bool) -> None:
         self._status          = message
