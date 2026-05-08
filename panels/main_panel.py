@@ -40,11 +40,15 @@ class MainPanel(lf.ui.Panel):
         self._world_pos: tuple | None        = None   # local 3-D position of last pick
         self._orig_images_folder: str | None = None   # override folder for EXIF scan
         self._export_splat_idx: int           = 0
-        self._export_format_idx: int         = 0      # 0=LAS, 1=LAZ
+        self._export_format_idx: int         = 0      # 0=LAS, 1=LAZ, 2=3D Tiles (SPZ)
         self._export_output_path: str | None = None
         self._export_progress: float | None  = None   # None=idle, 0-1=running
         self._export_error: str | None       = None
         self._export_success: str | None     = None
+        self._tiles_out_dir: str | None      = None
+        self._tiles_progress: float | None   = None
+        self._tiles_error: str | None        = None
+        self._tiles_success: str | None      = None
 
     @property
     def _mode(self) -> str:
@@ -69,6 +73,10 @@ class MainPanel(lf.ui.Panel):
         self._export_progress     = None
         self._export_error        = None
         self._export_success      = None
+        self._tiles_out_dir       = None
+        self._tiles_progress      = None
+        self._tiles_error         = None
+        self._tiles_success       = None
         self._clear_point()
         if doc is not None:
             self._detect_existing_registration()
@@ -578,7 +586,6 @@ class MainPanel(lf.ui.Panel):
         layout.separator()
         layout.label("Export")
         layout.separator()
-        layout.label("Export LAS/LAZ File")
 
         splat_names = self._get_splat_names()
         layout.label("Splat Model:")
@@ -592,15 +599,24 @@ class MainPanel(lf.ui.Panel):
             layout.text_colored("No splat models found in scene.", theme.palette.text_dim)
 
         layout.label("Format:")
-        fmt_changed, fmt_idx = layout.combo("##export_format", self._export_format_idx, ["LAS", "LAZ"])
+        fmt_changed, fmt_idx = layout.combo(
+            "##export_format", self._export_format_idx, ["LAS", "LAZ", "3D Tiles (SPZ)"]
+        )
         if fmt_changed:
             self._export_format_idx = fmt_idx
 
-        if self._export_output_path:
-            layout.spacing()
-            layout.text_colored(self._export_output_path, theme.palette.text_dim)
-
         layout.spacing()
+
+        if self._export_format_idx in (0, 1):
+            self._draw_las_export(layout, scale, theme, splat_names)
+        else:
+            self._draw_tiles_export(layout, scale, theme, splat_names)
+
+    def _draw_las_export(self, layout, scale, theme, splat_names) -> None:
+        if self._export_output_path:
+            layout.text_colored(self._export_output_path, theme.palette.text_dim)
+            layout.spacing()
+
         if self._export_progress is not None:
             pct = int(self._export_progress * 100)
             layout.progress_bar(self._export_progress, overlay=f"Exporting... {pct}%",
@@ -628,6 +644,34 @@ class MainPanel(lf.ui.Panel):
                         self._start_export_las(path)
                         lf.ui.request_redraw()
             else:
+                layout.text_colored("No splat models found in scene.", theme.palette.text_dim)
+
+    def _draw_tiles_export(self, layout, scale, theme, splat_names) -> None:
+        if self._tiles_out_dir:
+            layout.text_colored(self._tiles_out_dir, theme.palette.text_dim)
+            if layout.button_styled("Change Output Directory##tiles_change_dir", "warning", (-1, 28 * scale)):
+                self._pick_tiles_out_dir()
+        else:
+            layout.text_colored("No output directory selected.", theme.palette.text_dim)
+            if layout.button_styled("Choose Output Directory##tiles_pick_dir", "primary", (-1, 32 * scale)):
+                self._pick_tiles_out_dir()
+
+        layout.spacing()
+
+        if self._tiles_progress is not None:
+            pct = int(self._tiles_progress * 100)
+            layout.progress_bar(self._tiles_progress, overlay=f"Exporting... {pct}%",
+                                width=-1, height=24 * scale)
+        else:
+            if self._tiles_error:
+                layout.text_colored(f"[!] {self._tiles_error}", (1.0, 0.4, 0.4, 1.0))
+            if self._tiles_success:
+                layout.text_colored(self._tiles_success, (0.3, 1.0, 0.3, 1.0))
+            if splat_names and self._tiles_out_dir:
+                if layout.button_styled("Export 3D Tiles##export_tiles_btn", "primary", (-1, 32 * scale)):
+                    self._start_export_tiles()
+                    lf.ui.request_redraw()
+            elif not splat_names:
                 layout.text_colored("No splat models found in scene.", theme.palette.text_dim)
 
     def _get_splat_names(self) -> list[str]:
@@ -683,6 +727,73 @@ class MainPanel(lf.ui.Panel):
 
     def _on_export_progress(self, fraction: float) -> None:
         self._export_progress = fraction
+        lf.ui.request_redraw()
+
+    def _pick_tiles_out_dir(self) -> None:
+        folder = lf.ui.open_folder_dialog(title="Select 3D Tiles Output Directory")
+        if folder:
+            self._tiles_out_dir = folder
+            self._tiles_error   = None
+            self._tiles_success = None
+            lf.ui.request_redraw()
+
+    def _start_export_tiles(self) -> None:
+        import threading
+        import lichtfeld.scene as lf_scene
+
+        out_dir = Path(self._tiles_out_dir)
+
+        # Conflict check
+        for fname in ("tileset.json", "splats.glb"):
+            if (out_dir / fname).exists():
+                self._tiles_error = (
+                    f"{fname} already exists in the selected directory. "
+                    "Please choose a different directory."
+                )
+                lf.ui.request_redraw()
+                return
+
+        scene = lf.get_scene()
+        if scene is None:
+            self._tiles_error = "No scene loaded."
+            return
+
+        nodes = scene.get_nodes(type=lf_scene.NodeType.SPLAT)
+        if self._export_splat_idx >= len(nodes):
+            self._tiles_error = "Selected splat model not found."
+            return
+
+        node = nodes[self._export_splat_idx]
+        self._tiles_progress = 0.0
+        self._tiles_error    = None
+        self._tiles_success  = None
+        lf.ui.request_redraw()
+
+        threading.Thread(
+            target=self._export_tiles_worker,
+            args=(node, dict(self._transform), str(out_dir)),
+            daemon=True,
+        ).start()
+
+    def _export_tiles_worker(self, node, transform: dict, out_dir: str) -> None:
+        try:
+            from ..geo.tiles_exporter import export_3dtiles
+            export_3dtiles(
+                node, transform, out_dir,
+                sh_degree=3,
+                progress_cb=self._on_tiles_progress,
+            )
+            lf.log.info(f"geo_register: 3D Tiles exported to '{out_dir}'")
+            self._tiles_success = f"Export succeeded: {Path(out_dir).name}/"
+        except Exception as exc:
+            self._tiles_error = str(exc)
+            lf.log.error(f"geo_register: 3D Tiles export failed: {exc}")
+        finally:
+            self._tiles_progress = None
+            lf.ui.request_redraw()
+
+    def _on_tiles_progress(self, fraction: float) -> None:
+        self._tiles_progress = fraction
         lf.ui.request_redraw()
 
     def _detect_existing_registration(self) -> None:

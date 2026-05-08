@@ -243,6 +243,55 @@ identical to LAS; only the storage is compressed using the
 - Requires the `lazrs` or `laszip` Python package in the plugin environment
   (installed automatically with the plugin dependencies).
 
+### 3D Tiles — ArcGIS Gaussian Splat Layer
+
+The plugin can export the splat model as a georeferenced **3D Tiles 1.1** dataset
+that renders as full Gaussian splats (not a point cloud).
+
+**Output files:**
+
+```
+out_dir/
+  tileset.json   # 3D Tiles 1.1 manifest
+  splats.glb     # Binary glTF — SPZ-compressed splat data in the BIN chunk
+```
+
+**Tileset structure:**
+
+```
+root  (no transform — ECEF bounding volume only)
+└── child  (similarity transform: local → ECEF)
+      └── content: splats.glb
+```
+
+The similarity transform computed by the geo-registration is embedded directly
+as the child tile's `transform`, placing the splat cloud at the correct ECEF
+position on Earth.
+
+**Format details:**
+
+| Property | Value |
+|---|---|
+| 3D Tiles version | 1.1 |
+| glTF extension | `KHR_gaussian_splatting` + `KHR_gaussian_splatting_compression_spz_2` |
+| Compression | SPZ v3 (gzipped), ~17 bytes/splat for SH degree 3 |
+| SH bands | Up to degree 3 (full view-dependent colour) |
+| Tested on | ArcGIS Maps SDK 5.0 — should also work on CesiumJS ≥ 1.139 and ArcGIS Pro ≥ 3.6 |
+
+**[`KHR_gaussian_splatting`](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_gaussian_splatting)**
+is a ratified Khronos glTF 2.0 extension for embedding 3D Gaussian Splat data inside
+a standard glTF/GLB asset. It defines per-primitive attributes for position, rotation,
+scale, opacity, and spherical harmonic coefficients, with a companion compression
+extension (`KHR_gaussian_splatting_compression_spz_2`) that wraps the payload in an
+SPZ blob.
+
+**SPZ (Splat Zip) v3** is an open binary format for compact Gaussian splat storage,
+developed by [Niantic Labs](https://github.com/nianticlabs/spz) (MIT licence).
+It encodes positions, rotations, scales, opacity, and spherical harmonic coefficients
+into a single gzipped binary blob (~17 bytes/splat at SH degree 3, roughly 14× smaller
+than the source PLY). The encoder used here is a pure-Python implementation that mirrors
+the Niantic reference byte-for-byte.
+
 ---
 
 ## Requirements
