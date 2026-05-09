@@ -1,0 +1,9 @@
+{
+  "las_export_coordinates": "UTM",
+
+  "ransac_inlier_thr_m":  10.0,
+  "ransac_confidence":     0.99,
+  "ransac_max_iter":       2000,
+  "irls_huber_delta_m":    2.0,
+  "irls_max_iter":         50
+}

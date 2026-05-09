@@ -210,6 +210,39 @@ After a successful solve the plugin writes to `<output_dir>/geo_register_plugin_
 
 ---
 
+## Configuration
+
+The plugin reads `config.json` from its root directory at runtime. All keys are optional;
+the defaults below are used when a key is absent or the file does not exist.
+
+```json
+{
+  "las_export_coordinates": "UTM",
+
+  "ransac_inlier_thr_m": 10.0,
+  "ransac_confidence":    0.99,
+  "ransac_max_iter":      2000,
+  "irls_huber_delta_m":   2.0,
+  "irls_max_iter":        50
+}
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `las_export_coordinates` | `"UTM"` | Output CRS for LAS/LAZ export: `"UTM"` or `"LLA"` (EPSG:4326) |
+| `ransac_inlier_thr_m` | `10.0` | RANSAC inlier threshold in metres — correspondences with a larger residual are rejected as outliers |
+| `ransac_confidence` | `0.99` | Target probability that RANSAC finds the correct model; drives the adaptive iteration count |
+| `ransac_max_iter` | `2000` | Hard cap on RANSAC iterations regardless of the adaptive estimate |
+| `irls_huber_delta_m` | `2.0` | Huber loss delta (metres) for IRLS refinement — points below this residual receive full weight |
+| `irls_max_iter` | `50` | Maximum IRLS iterations |
+
+> **Tuning tips:**
+> - Increase `ransac_inlier_thr_m` if your GPS data is noisy (e.g. consumer-grade EXIF) and the solver rejects too many correspondences.
+> - Decrease it when you have RTK-quality GPS and want stricter outlier rejection.
+> - `irls_huber_delta_m` should be smaller than `ransac_inlier_thr_m` — a good rule of thumb is roughly ¼ of the inlier threshold.
+
+---
+
 ## Export
 
 Once geo-registration is complete, the plugin can export any splat model visible in the
@@ -226,7 +259,21 @@ LAS is the industry-standard binary format for point cloud data, maintained by t
 [ASPRS](https://www.asprs.org/divisions-committees/lidar-division/laser-las-file-format-exchange-activities).
 The plugin writes **LAS 1.4, point format 7** (XYZ + RGB colour).
 
-- Coordinates are stored in **EPSG:4326** (WGS-84 geographic): X = longitude, Y = latitude, Z = ellipsoidal height in metres.
+The output coordinate system is controlled by `las_export_coordinates` in `config.json`
+(see [Configuration](#configuration)):
+
+| Setting | CRS | X | Y | Z |
+|---|---|---|---|---|
+| `"UTM"` *(default)* | WGS-84 / UTM zone auto-selected from point-cloud median | Easting (m) | Northing (m) | Ellipsoidal height (m) |
+| `"LLA"` | EPSG:4326 geographic | Longitude (°) | Latitude (°) | Ellipsoidal height (m) |
+
+When `UTM` is selected:
+- The UTM zone is determined from the **median latitude and longitude** of the exported
+  point cloud — a robust centroid that ignores outliers.
+- Northern/southern hemisphere is set automatically from the sign of the median latitude.
+- The EPSG code is derived accordingly (e.g. `EPSG:32636` for UTM zone 36N).
+
+For both modes:
 - An **OGC WKT CRS record** is embedded in the file header so any compliant GIS tool
   (QGIS, ArcGIS, CloudCompare, etc.) can read the coordinate system automatically.
 - Gaussian splat positions are transformed from scene space to ECEF using the solved

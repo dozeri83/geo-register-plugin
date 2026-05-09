@@ -364,7 +364,17 @@ class MainPanel(lf.ui.Panel):
 
         lf.log.info(f"geo_register: {len(src_pts)} correspondences - running RANSAC+IRLS ...")
         try:
-            result = robust_umeyama(src_pts, dst_pts)
+            import json
+            _cfg_path = Path(__file__).parent.parent / "config.json"
+            _cfg = json.loads(_cfg_path.read_text(encoding="utf-8")) if _cfg_path.exists() else {}
+            result = robust_umeyama(
+                src_pts, dst_pts,
+                inlier_thr     = float(_cfg.get("ransac_inlier_thr_m",  10.0)),
+                confidence     = float(_cfg.get("ransac_confidence",      0.99)),
+                max_ransac_iter= int(  _cfg.get("ransac_max_iter",        2000)),
+                huber_delta    = float(_cfg.get("irls_huber_delta_m",     2.0)),
+                max_irls_iter  = int(  _cfg.get("irls_max_iter",          50)),
+            )
         except Exception as exc:
             self._set_status(f"Transform estimation failed: {exc}", error=True)
             lf.log.error(f"geo_register: {exc}")
