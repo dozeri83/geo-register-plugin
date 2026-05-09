@@ -56,20 +56,7 @@ to its camera pose by filename stem, and runs the solver.
 > images and the dataset cameras — for example, `DJI_0001.jpg` (original) matches
 > `DJI_0001.JPG` or `DJI_0001.png` in the dataset.
 
-> **Note on undistorted images:**
-> Tools like RealityCapture, RealityScan, and COLMAP often undistort or re-encode images
-> during processing, which strips the original EXIF metadata — including GPS tags.
->
-> **If your images have been undistorted, you have two options:**
->
-> - **Preferred:** Skip undistortion and use the original images directly. LichtFeld Studio can undistort the images natively.
->
-> - **Alternative:** Copy the EXIF data from the originals to the undistorted images
->   using [ExifTool](https://exiftool.org/):
->   ```
->   exiftool -tagsfromfile original/%f.jpg -gps:all undistorted/%f.jpg
->   ```
->   Run this command in the folder that contains both your original and undistorted images.
+> **Note:** EXIF GPS accuracy may not be accurate, especially in the altitude direction. For more accurate results, use professional alignment tools with GCPs (ground control points).
 
 ---
 
