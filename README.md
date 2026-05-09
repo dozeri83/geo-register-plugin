@@ -2,6 +2,8 @@
 
 Registers a [LichtFeld Studio](https://github.com/MrNeRF/LichtFeld-Studio/) scene to real-world geographic coordinates (WGS-84 / ECEF).
 Once registered, clicking any point on the model returns its latitude, longitude, and altitude.
+The plugin can also export geo-referenced splat models as **LAS/LAZ** point clouds or
+**3D Tiles 1.1** datasets (ArcGIS Gaussian Splat Layer / CesiumJS).
 
 ![Geo Register Plugin in action](assets/plugin_example.jpg)
 
