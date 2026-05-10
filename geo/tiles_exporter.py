@@ -177,24 +177,25 @@ def _write_spz_glb(path: Path, spz_blob: bytes, num_points: int,
 
 # ─── Tileset builder ──────────────────────────────────────────────────────────
 
-def _build_tileset(sim: dict, positions: np.ndarray, content_uri: str) -> dict:
+def _build_tileset(sim: dict, positions: np.ndarray, content_uri: str,
+                   world_transform: np.ndarray | None = None) -> dict:
     """Build tileset.json dict.
 
-    Positions are expected in dataset-world space (Y-down / Z-fwd, after
-    world_transform but before the GL Y/Z-negate). The diag(1,-1,-1) flip
-    is baked into the tile transform so the geometry matches the bbox.
+    Positions are in the splat's local space (model-local).  world_transform
+    (4×4, model-local → scene-world) is baked into the tile matrix when
+    supplied, so the renderer applies the full chain uniformly.
     """
     s = float(sim["scale"])
     R = np.array(sim["rotation"], dtype=np.float64).reshape(3, 3)
     t = np.array(sim["translation"], dtype=np.float64)
 
-    # Build 4x4 local→ECEF matrix with GL flip (diag(1,-1,-1)) baked in.
-    # The boundingVolume is expressed in this tile's local space; the renderer
-    # applies the transform to it automatically — no ECEF projection needed.
+    # M = sim @ diag(1,-1,-1) [@ W]  — all applied by the renderer uniformly.
     M = np.eye(4, dtype=np.float64)
     M[:3, :3] = s * R
     M[:3, 3] = t
     M = M @ np.diag([1.0, -1.0, -1.0, 1.0])
+    if world_transform is not None:
+        M = M @ world_transform
 
     transform_col_major = M.T.flatten().tolist()
 
@@ -240,17 +241,18 @@ def _build_tileset(sim: dict, positions: np.ndarray, content_uri: str) -> dict:
 # ─── Core encoder (numpy arrays in, files out) ───────────────────────────────
 
 def _export_from_arrays(
-    positions_local: np.ndarray,   # (N, 3) dataset world (Y-down/Z-fwd)
-    rotations_wxyz:  np.ndarray,   # (N, 4) quaternion wxyz (may be None → identity)
-    scales_log:      np.ndarray,   # (N, 3) log-space scales
-    opacity_logit:   np.ndarray,   # (N,) raw 3DGS logit
-    f_dc:            np.ndarray,   # (N, 3) raw SH0 coefficients
-    f_rest_rgb:      np.ndarray | None,  # (N, K, 3) or None
+    positions_local: np.ndarray,          # (N, 3) model-local space
+    rotations_wxyz:  np.ndarray,          # (N, 4) quaternion wxyz (may be None → identity)
+    scales_log:      np.ndarray,          # (N, 3) log-space scales
+    opacity_logit:   np.ndarray,          # (N,) raw 3DGS logit
+    f_dc:            np.ndarray,          # (N, 3) raw SH0 coefficients
+    f_rest_rgb:      np.ndarray | None,   # (N, K, 3) or None
     sh_degree:       int,
     transform:       dict,
     out_dir:         Path,
     content_name:    str,
     progress_cb,
+    world_transform: np.ndarray | None = None,  # 4×4 model-local → scene-world
 ) -> None:
     def prog(f):
         if progress_cb:
@@ -288,7 +290,7 @@ def _export_from_arrays(
     _write_spz_glb(glb_path, spz, int(len(positions)), sh_degree, positions)
     prog(0.8)
 
-    tileset = _build_tileset(transform, positions, content_name)
+    tileset = _build_tileset(transform, positions, content_name, world_transform)
     with open(out_dir / "tileset.json", "w", encoding="utf-8") as f:
         json.dump(tileset, f, indent=2)
     prog(1.0)
@@ -334,123 +336,65 @@ def export_3dtiles(
 
     prog(0.05)
 
-    # ── Positions (apply world_transform → dataset world Y-down/Z-fwd) ────────
-    means = np.asarray(splat_data.means_raw.cpu().numpy(), dtype=np.float64)
-    W     = np.asarray(node.world_transform, dtype=np.float64).reshape(4, 4)
-    ones  = np.ones((means.shape[0], 1), dtype=np.float64)
-    means_world = (W @ np.hstack([means, ones]).T).T[:, :3].astype(np.float32)
+    W = np.asarray(node.world_transform, dtype=np.float64).reshape(4, 4)
+
+    # ── Positions (raw model-local; world_transform goes into tileset matrix) ─
+    means = np.asarray(splat_data.means_raw.cpu().numpy(), dtype=np.float32)
 
     # ── Filter deleted gaussians ──────────────────────────────────────────────
     deleted_raw = np.asarray(splat_data.deleted.cpu().numpy())
     if deleted_raw.ndim == 0:
-        keep = np.ones(means_world.shape[0], dtype=bool)
+        keep = np.ones(means.shape[0], dtype=bool)
     else:
         keep = ~deleted_raw.astype(bool)
-    means_world = means_world[keep]
+    means = means[keep]
 
     prog(0.10)
 
-    # ── Rotations ─────────────────────────────────────────────────────────────
-    rot_raw = _probe(splat_data, "get_rotation", "get_rotations", "rotations_raw", "rotation")
-    if rot_raw is None:
-        raise RuntimeError(
-            "Cannot find rotation data on splat_data. "
-            "Tried: get_rotation, get_rotations, rotations_raw, rotation"
-        )
-    rot_np = np.asarray(rot_raw.cpu().numpy(), dtype=np.float64)[keep]   # (N, 4) wxyz
-
-    # Build total rotation: Q_R ⊗ Q_gl ⊗ Q_W  (applied left-to-right to each splat q)
-    W3 = W[:3, :3]
-    U, _, Vt = np.linalg.svd(W3)
-    R_W = U @ Vt
-    if np.linalg.det(R_W) < 0:
-        U[:, -1] *= -1
-        R_W = U @ Vt
-    Q_W  = _mat3_to_quat_wxyz(R_W)
-    Q_gl = np.array([0.0, 1.0, 0.0, 0.0])   # 180° around X
-    Q_R  = _mat3_to_quat_wxyz(np.array(sim["rotation"], dtype=np.float64).reshape(3, 3))
-
-    Q_total = _quat_mul(Q_R, _quat_mul(Q_gl, Q_W))
-    rotations_wxyz = _quat_mul_batch(Q_total, rot_np).astype(np.float32)
+    # ── Rotations (raw model-local; tile transform handles the rest) ──────────
+    rotations_wxyz = np.asarray(
+        splat_data.get_rotation().cpu().numpy(), dtype=np.float32
+    )[keep]
 
     prog(0.18)
 
-    # ── Scales ────────────────────────────────────────────────────────────────
-    s_W = float(np.cbrt(abs(np.linalg.det(W3))))
-
-    scales_lin = _probe(splat_data, "get_scaling", "get_scales")
-    if scales_lin is not None:
-        sc = np.asarray(scales_lin.cpu().numpy(), dtype=np.float32)[keep] * s_W
-        scales_log = np.log(np.clip(sc, 1e-20, None)).astype(np.float32)
-    else:
-        sc_raw = _probe(splat_data, "scales_raw", "scaling")
-        if sc_raw is None:
-            raise RuntimeError(
-                "Cannot find scale data on splat_data. "
-                "Tried: get_scaling, get_scales, scales_raw, scaling"
-            )
-        scales_log = (np.asarray(sc_raw.cpu().numpy(), dtype=np.float32)[keep]
-                      + float(np.log(s_W))).astype(np.float32)
+    # ── Scales (raw log-space; tile transform handles world scale) ────────────
+    scales_log = np.asarray(splat_data.scaling_raw.cpu().numpy(), dtype=np.float32)[keep]
 
     prog(0.25)
 
     # ── Opacity ───────────────────────────────────────────────────────────────
-    op_raw = _probe(splat_data, "get_opacities", "opacities_raw", "opacity_raw", "opacity")
-    if op_raw is None:
-        raise RuntimeError(
-            "Cannot find opacity data on splat_data. "
-            "Tried: get_opacities, opacities_raw, opacity_raw, opacity"
-        )
-    opacity_logit = np.asarray(op_raw.cpu().numpy(), dtype=np.float32).ravel()[keep]
+    opacity_logit = np.asarray(
+        splat_data.opacity_raw.cpu().numpy(), dtype=np.float32
+    ).ravel()[keep]
 
     prog(0.30)
 
-    # ── SH0 (f_dc) ────────────────────────────────────────────────────────────
-    f_dc_raw = _probe(splat_data, "features_dc", "sh_dc", "get_sh_dc", "f_dc")
-    if f_dc_raw is not None:
-        f_dc = np.asarray(f_dc_raw.cpu().numpy(), dtype=np.float32)
-        if f_dc.ndim == 3:
-            f_dc = f_dc[:, 0, :]       # (N, 1, 3) → (N, 3)
-        f_dc = f_dc[keep]
-    else:
-        # Reverse-engineer from baked RGB: rgb = f_dc * SH_C0 + 0.5
-        baked = np.asarray(splat_data.get_colors_rgb().cpu().numpy(), dtype=np.float32)[keep]
-        f_dc = (baked - 0.5) / float(SH_C0)
+    # ── SH0 (f_dc) — LFS stores as [N, 1, 3] ─────────────────────────────────
+    f_dc = np.asarray(splat_data.sh0_raw.cpu().numpy(), dtype=np.float32)[keep]
+    f_dc = f_dc[:, 0, :]   # (N, 1, 3) → (N, 3)
 
     prog(0.35)
 
-    # ── Higher SH ─────────────────────────────────────────────────────────────
+    # ── Higher SH — LFS stores shN_raw as [N, K, 3], already correct layout ──
     f_rest_rgb = None
     effective_sh = sh_degree
     if sh_degree > 0:
-        rest_raw = _probe(splat_data, "features_rest", "sh_rest", "get_sh_rest", "f_rest")
-        if rest_raw is not None:
-            rest_np = np.asarray(rest_raw.cpu().numpy(), dtype=np.float32)[keep]
-            if rest_np.ndim == 2:
-                K3 = rest_np.shape[1]
-                if K3 % 3 == 0:
-                    # Inria layout: (N, K*3) → (N, 3, K) channel-major → (N, K, 3)
-                    K = K3 // 3
-                    rest_np = rest_np.reshape(-1, 3, K).transpose(0, 2, 1)
-                else:
-                    effective_sh = 0
-            elif rest_np.ndim == 3 and rest_np.shape[1] == 3:
-                rest_np = rest_np.transpose(0, 2, 1)   # (N, 3, K) → (N, K, 3)
-            if effective_sh > 0:
-                needed = DIM_FOR_DEGREE[sh_degree]
-                if rest_np.shape[1] >= needed:
-                    f_rest_rgb = np.ascontiguousarray(
-                        rest_np[:, :needed, :].astype(np.float32)
-                    )
-                else:
-                    effective_sh = 0
+        rest_np = np.asarray(splat_data.shN_raw.cpu().numpy(), dtype=np.float32)
+        if rest_np.ndim == 3 and rest_np.shape[1] > 0:
+            rest_np = rest_np[keep]
+            needed = DIM_FOR_DEGREE[sh_degree]
+            if rest_np.shape[1] >= needed:
+                f_rest_rgb = np.ascontiguousarray(rest_np[:, :needed, :])
+            else:
+                effective_sh = 0
         else:
             effective_sh = 0
 
     prog(0.40)
 
     _export_from_arrays(
-        positions_local=means_world,
+        positions_local=means,
         rotations_wxyz=rotations_wxyz,
         scales_log=scales_log,
         opacity_logit=opacity_logit,
@@ -461,6 +405,7 @@ def export_3dtiles(
         out_dir=out_dir,
         content_name=content_name,
         progress_cb=lambda f: prog(0.40 + 0.60 * f),
+        world_transform=W,
     )
 
 
