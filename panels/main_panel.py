@@ -803,6 +803,10 @@ class MainPanel(lf.ui.Panel):
             daemon=True,
         ).start()
 
+    def _on_tiles_progress(self, fraction: float) -> None:
+        self._tiles_progress = fraction
+        lf.ui.request_redraw()
+
     def _export_tiles_worker(self, node, transform: dict, out_dir: str) -> None:
         try:
             from ..geo.tiles_exporter import export_3dtiles
