@@ -164,6 +164,13 @@ In the export settings, set the coordinate system to **Project Output**.
 
 ![RealityScan export settings](assets/rs_export_settings.png)
 
+> **Important — Colmap export:** The output coordinate system setting is **global** for
+> all RealityScan exports. If you later export to **Colmap** format, you must change it
+> back to **Grid Plane / Local Euclidean** — Colmap expects Euclidean (non-geographic)
+> coordinates, and leaving it set to EPSG:4326 will produce incorrect results.
+>
+> ![RealityScan Colmap export coordinate system setting](assets/rc_export_colmap_settings.png)
+
 **Step 3 — Load in the plugin:**
 
 1. Select **RealityScan Parameters CSV** from the Source dropdown.
