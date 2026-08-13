@@ -89,8 +89,29 @@ def _probe(obj, *names):
 
 # ─── GLB writer ───────────────────────────────────────────────────────────────
 
+def _node_matrix_col_major(center: np.ndarray | None) -> list:
+    """glTF node matrix (column-major, 16 floats).
+
+    The mesh node applies the fixed Y-up→Z-up rotation Gnode. When positions are
+    recentered by `center` before encoding, we fold the offset back in as
+    node = Gnode @ translate(center), so node @ (p - center) == Gnode @ p and the
+    rendered result is unchanged. glTF matrices are column-major.
+    """
+    Gnode = np.array([[1.0, 0.0, 0.0, 0.0],
+                      [0.0, 0.0, 1.0, 0.0],
+                      [0.0, -1.0, 0.0, 0.0],
+                      [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
+    node = Gnode
+    if center is not None:
+        T = np.eye(4, dtype=np.float64)
+        T[:3, 3] = np.asarray(center, dtype=np.float64)
+        node = Gnode @ T
+    return node.T.flatten().tolist()
+
+
 def _write_spz_glb(path: Path, spz_blob: bytes, num_points: int,
-                   sh_degree: int, positions: np.ndarray) -> None:
+                   sh_degree: int, positions: np.ndarray,
+                   center: np.ndarray | None = None) -> None:
     pmin = positions.min(axis=0).tolist()
     pmax = positions.max(axis=0).tolist()
 
@@ -132,12 +153,7 @@ def _write_spz_glb(path: Path, spz_blob: bytes, num_points: int,
         ],
         "scene": 0,
         "scenes": [{"nodes": [0]}],
-        "nodes": [{"mesh": 0, "matrix": [
-            1.0, 0.0,  0.0, 0.0,
-            0.0, 0.0, -1.0, 0.0,
-            0.0, 1.0,  0.0, 0.0,
-            0.0, 0.0,  0.0, 1.0,
-        ]}],
+        "nodes": [{"mesh": 0, "matrix": _node_matrix_col_major(center)}],
         "meshes": [{"primitives": [{
             "mode": 0,
             "material": 0,
@@ -275,19 +291,42 @@ def _export_from_arrays(
 
     prog(0.2)
 
+    # SPZ v3 stores positions as 24-bit signed fixed-point. With the default
+    # fractional_bits=12 the representable range is only ±2048 m, so any scene
+    # whose model-local coordinates exceed that (e.g. uncentered DPVO reconstructions
+    # extending several km along the view axis) silently *wraps*, badly displacing
+    # the splats. Fix: recenter positions about their bbox center before encoding
+    # and pick fractional_bits so the recentered extent fits the 24-bit range. The
+    # center offset is folded back into the GLB node matrix so the rendered result
+    # is identical (chain: root.transform @ node @ (p - center) == root.transform
+    # @ Gnode @ p).
+    pos64 = positions.astype(np.float64)
+    center = (pos64.min(axis=0) + pos64.max(axis=0)) * 0.5
+    pos_centered = (pos64 - center).astype(np.float32)
+
+    max_abs = float(np.max(np.abs(pos_centered))) if len(pos_centered) else 0.0
+    frac_bits = 12
+    if max_abs > 0.0:
+        # keep 2^frac_bits * max_abs strictly below 2^23 (one bit of headroom)
+        import math
+        frac_bits = int(math.floor(math.log2((1 << 22) / max_abs)))
+        frac_bits = max(0, min(12, frac_bits))
+
     spz = encode_spz_v3(
-        positions=positions,
+        positions=pos_centered,
         rotations_xyzw=rotations_xyzw,
         scales_log=scales_log.astype(np.float32),
         opacity_logit=opacity_logit.astype(np.float32),
         f_dc=f_dc.astype(np.float32),
         f_rest_rgb=f_rest_rgb,
         sh_degree=sh_degree,
+        fractional_bits=frac_bits,
     )
     prog(0.55)
 
     glb_path = out_dir / content_name
-    _write_spz_glb(glb_path, spz, int(len(positions)), sh_degree, positions)
+    _write_spz_glb(glb_path, spz, int(len(positions)), sh_degree,
+                   pos_centered, center=center)
     prog(0.8)
 
     tileset = _build_tileset(transform, positions, content_name, world_transform)
