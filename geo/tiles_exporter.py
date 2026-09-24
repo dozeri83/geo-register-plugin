@@ -132,9 +132,11 @@ def _write_spz_glb(path: Path, spz_blob: bytes, num_points: int,
     add_acc("COLOR_0", "VEC4", 5121, normalized=True)
     add_acc("KHR_gaussian_splatting:SCALE", "VEC3", 5126)
     add_acc("KHR_gaussian_splatting:ROTATION", "VEC4", 5126)
+    add_acc("KHR_gaussian_splatting:OPACITY", "SCALAR", 5126)
+    add_acc("KHR_gaussian_splatting:SH_DEGREE_0_COEF_0", "VEC3", 5126)
     for d in range(1, sh_degree + 1):
         for k in range({1: 3, 2: 5, 3: 7}[d]):
-            add_acc(f"KHR_gaussian_splatting:SH_DEGREE_{d}_COEF_{k}", "VEC4", 5126)
+            add_acc(f"KHR_gaussian_splatting:SH_DEGREE_{d}_COEF_{k}", "VEC3", 5126)
 
     spz_len = len(spz_blob)
     bin_pad = (-spz_len) % 4
@@ -160,6 +162,8 @@ def _write_spz_glb(path: Path, spz_blob: bytes, num_points: int,
             "attributes": attrs,
             "extensions": {
                 "KHR_gaussian_splatting": {
+                    "kernel": "ellipse",
+                    "colorSpace": "srgb_rec709_display",
                     "extensions": {
                         "KHR_gaussian_splatting_compression_spz_2": {"bufferView": 0}
                     }
@@ -555,9 +559,9 @@ def main():
     with open(args.similarity_json) as f:
         transform = json.load(f)
     transform = {
-        "s": transform["scale"],
-        "R": transform["rotation"],
-        "t": transform["translation"],
+        "scale": transform["scale"],
+        "rotation": transform["rotation"],
+        "translation": transform["translation"],
     }
 
     def log_prog(f):
