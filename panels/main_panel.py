@@ -8,6 +8,105 @@ _OP_ID = "lfs_plugins.geo_register_pluggin.operators.geo_picker.GEO_OT_pick_loca
 # Module-level world position so the draw handler can access it without a panel ref.
 _active_world_pos: tuple | None = None
 
+# The plugin's registered name (its package folder), used as its data folder name.
+_PLUGIN_ID = __package__.split(".")[1] if __package__ and __package__.count(".") >= 1 else "geo_register_pluggin"
+
+
+def _normalized(path) -> str:
+    import os
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _camera_image_dir() -> str | None:
+    """Common folder of the scene's camera images, or None without cameras."""
+    import os
+    import lichtfeld.scene as lf_scene
+
+    scene = lf.get_scene()
+    if scene is None:
+        return None
+    dirs = {os.path.dirname(n.image_path)
+            for n in scene.get_nodes(type=lf_scene.NodeType.CAMERA) if n.image_path}
+    if not dirs:
+        return None
+    try:
+        return os.path.commonpath(list(dirs))
+    except ValueError:  # images on different drives
+        return None
+
+
+def _dataset_path() -> str | None:
+    """Dataset the scene's camera poses come from.
+
+    Opening a .licht project leaves dataset_params() and AppState.scene_path
+    empty, so fall back to the folder holding the camera images (minus the
+    dataset's images subfolder, e.g. <dataset>/images -> <dataset>).
+    """
+    from lfs_plugins.ui.state import AppState
+
+    params = lf.dataset_params()
+    if params and params.data_path:
+        return str(params.data_path)
+    if AppState.scene_path.value:
+        return str(AppState.scene_path.value)
+    image_dir = _camera_image_dir()
+    if not image_dir:
+        return None
+    images_sub = (params.images if params else None) or "images"
+    image_dir = Path(image_dir)
+    return str(image_dir.parent if image_dir.name.lower() == images_sub.lower() else image_dir)
+
+
+def _plugin_root_dir() -> Path:
+    """This plugin's durable data folder, as defined by LFS.
+
+    lf.plugins.data_dir() gives <lfs data>/plugin_data/<plugin>/; older LFS
+    builds without it get the same layout under the LFS user home.
+    """
+    data_dir = getattr(lf.plugins, "data_dir", None)
+    if data_dir:
+        return Path(data_dir(_PLUGIN_ID))
+    try:
+        from lfs_plugins.asset_storage import lichtfeld_home
+        home = Path(lichtfeld_home())
+    except Exception:
+        home = Path.home() / ".lichtfeld"
+    return home / "data" / "plugin_data" / _PLUGIN_ID
+
+
+def _project_uuid() -> str | None:
+    get_uuid = getattr(lf, "project_uuid", None)  # absent before LFS exposed it
+    return get_uuid() if get_uuid else None
+
+
+def _data_key() -> str | None:
+    """<project file stem>_<short project UUID>.
+
+    The UUID survives saves, renames and Save As, so a model-only reopen of the
+    project still finds its registration. Unsaved projects use 'untitled'.
+    LFS builds without the project API fall back to the dataset folder name
+    plus a short hash of its path.
+    """
+    import hashlib
+
+    uuid = _project_uuid()
+    if uuid:
+        get_path = getattr(lf, "project_path", None)
+        path = get_path() if get_path else None
+        stem = Path(path).stem if path else "untitled"
+        return f"{stem}_{uuid[:8]}"
+    dataset = _dataset_path()
+    if not dataset:
+        return None
+    digest = hashlib.sha1(_normalized(dataset).encode("utf-8")).hexdigest()[:8]
+    return f"{Path(dataset).name or 'dataset'}_{digest}"
+
+
+def _plugin_data_dir() -> Path | None:
+    """<plugin data dir>/<project stem>_<short uuid>/"""
+    key = _data_key()
+    return _plugin_root_dir() / key if key else None
+
 
 def _geo_draw_handler(ctx) -> None:
     pos = _active_world_pos
@@ -26,6 +125,11 @@ class MainPanel(lf.ui.Panel):
     label = "Geo Reference"
     space = lf.ui.PanelSpace.MAIN_PANEL_TAB
     order = 50
+    # LFS panels default to dirty-driven redraws, which only follow panel input
+    # and scene changes. Picks (modal operator) and export progress (worker
+    # threads) change state outside the panel, so redraw on an interval.
+    update_policy      = "interval"
+    update_interval_ms = 100
 
     _MODES     = ["EXIF", "Similarity File", "Image Positions CSV", "RealityScan Parameters CSV", "Metashape Cameras XML"]
     _MODE_KEYS = ["exif", "similarity", "csv", "rs_csv", "metashape_xml"]
@@ -104,13 +208,24 @@ class MainPanel(lf.ui.Panel):
         theme = lf.ui.theme()
 
         # If no cameras are present the user has switched to Edit Mode and the
-        # dataset (including camera data) has been discarded.  Geo-registration
-        # requires camera information, so show a blocking notice and return.
+        # dataset (including camera data) has been discarded.  Solving needs
+        # cameras, but a registration saved for this project still applies to
+        # its splats, so offer picking and export before the PLY converter.
         scene = lf.get_scene()
         if scene is not None:
             import lichtfeld.scene as lf_scene
             has_cameras = any(True for _ in scene.get_nodes(type=lf_scene.NodeType.CAMERA))
             if not has_cameras:
+                if self._transform is not None:
+                    layout.label("Geo Reference (saved for this project)")
+                    if self._status:
+                        prefix = "[!] " if self._status_is_error else "[ok] "
+                        color  = (1.0, 0.4, 0.4, 1.0) if self._status_is_error else (0.4, 1.0, 0.4, 1.0)
+                        layout.text_colored(prefix + self._status, color)
+                    self._draw_transform_section(layout, scale, theme)
+                    self._draw_export_section(layout, scale, theme)
+                    layout.separator()
+                    layout.spacing()
                 self._draw_ply_converter_section(layout, scale, theme)
                 return
 
@@ -288,15 +403,13 @@ class MainPanel(lf.ui.Panel):
     # ── Georeference pipeline ─────────────────────────────────────────────────
 
     def _run_exif(self):
-        from lfs_plugins.ui.state import AppState
         from ..geo.exif_reader import find_images_with_gps, NoGPSDataError
 
         self._transform = None
         self._lla = None
         self._clear_point()
 
-        scene_path = AppState.scene_path.value
-        if not scene_path or lf.get_scene() is None:
+        if lf.get_scene() is None:
             self._set_status("No scene is currently loaded.", error=True)
             return
 
@@ -309,7 +422,11 @@ class MainPanel(lf.ui.Panel):
             if data_path:
                 scan_folder = str(Path(data_path) / images_sub) if images_sub else data_path
             else:
-                scan_folder = scene_path
+                # Project (.licht) loads: scan where the camera images live.
+                scan_folder = _camera_image_dir() or _dataset_path()
+            if not scan_folder:
+                self._set_status("Cannot find the dataset images. Use Set Original Images Folder.", error=True)
+                return
         lf.log.info(f"geo_register: scanning '{scan_folder}' for GPS EXIF ...")
         try:
             raw = find_images_with_gps(scan_folder)
@@ -330,15 +447,17 @@ class MainPanel(lf.ui.Panel):
         self._run_georeg(gps_list)
 
     def _run_georeg(self, gps_list: list) -> None:
-        from lfs_plugins.ui.state import AppState
         from ..geo.camera_reader import read_camera_positions_from_scene
         from ..geo.ecef import geodetic_to_ecef
         from ..geo.transform import robust_umeyama
 
-        scene_path = AppState.scene_path.value
         scene = lf.get_scene()
-        if not scene_path or scene is None:
+        if scene is None:
             self._set_status("No scene is currently loaded.", error=True)
+            return
+        out_dir = _plugin_data_dir()
+        if out_dir is None:
+            self._set_status("Cannot determine where to store the registration (no project or dataset).", error=True)
             return
 
         cameras = read_camera_positions_from_scene(scene)
@@ -387,7 +506,7 @@ class MainPanel(lf.ui.Panel):
             return
 
         self._transform = result
-        saved_json, saved_csv = self._save_transform(result, scene_path, matched_gps)
+        saved_json, saved_csv = self._save_transform(result, out_dir, matched_gps)
         n_in  = result.get("n_inliers", result["n"])
         n_tot = result.get("n_total",   result["n"])
         status = f"Ready -- {n_in}/{n_tot} inliers, RMSE {result['rmse']:.3f} m"
@@ -583,11 +702,10 @@ class MainPanel(lf.ui.Panel):
                 "n_total":   data.get("n_total",   n),
             }
 
-            # Copy to output dir if the file is not already there
+            # Copy to the project's plugin data dir if the file is not already there
             copied_to = None
-            output_path = lf.dataset_params().output_path
-            if output_path:
-                expected_dir = Path(output_path) / "geo_register_plugin_data"
+            expected_dir = _plugin_data_dir()
+            if expected_dir is not None:
                 src = Path(path)
                 if src.parent.resolve() != expected_dir.resolve():
                     expected_dir.mkdir(parents=True, exist_ok=True)
@@ -606,13 +724,10 @@ class MainPanel(lf.ui.Panel):
             self._set_status(f"Failed to load file: {exc}", error=True)
             lf.log.error(f"geo_register: {exc}")
 
-    def _save_transform(self, result: dict, scene_path: str, matched_gps: list | None = None) -> tuple:
+    def _save_transform(self, result: dict, out_dir: Path, matched_gps: list | None = None) -> tuple:
         import json
         import csv
 
-        output_path = lf.dataset_params().output_path
-        base = Path(output_path) if output_path else Path(scene_path)
-        out_dir = base / "geo_register_plugin_data"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         payload = {
@@ -622,6 +737,8 @@ class MainPanel(lf.ui.Panel):
             "rmse_m": result["rmse"],
             "n_inliers": result.get("n_inliers", result["n"]),
             "n_total": result.get("n_total", result["n"]),
+            "project_uuid": _project_uuid(),
+            "dataset_path": _dataset_path(),
         }
 
         out_file = out_dir / "similarity_transform.json"
@@ -1151,16 +1268,11 @@ class MainPanel(lf.ui.Panel):
 
     def _detect_existing_registration(self) -> None:
         import json
-        from lfs_plugins.ui.state import AppState
 
-        scene_path = AppState.scene_path.value
-        if not scene_path:
+        data_dir = _plugin_data_dir()
+        if data_dir is None:
             return
-
-        params = lf.dataset_params()
-        output_path = params.output_path if params else None
-        base = Path(output_path) if output_path else Path(scene_path)
-        candidate = base / "geo_register_plugin_data" / "similarity_transform.json"
+        candidate = data_dir / "similarity_transform.json"
 
         if not candidate.exists():
             return
@@ -1172,6 +1284,12 @@ class MainPanel(lf.ui.Panel):
             for key in ("scale", "rotation", "translation"):
                 if key not in data:
                     return
+
+            # The folder key only holds a short UUID; the full one guards collisions.
+            stored, current = data.get("project_uuid"), _project_uuid()
+            if stored and current and stored != current:
+                lf.log.warn(f"geo_register: ignoring '{candidate}', it belongs to project {stored}")
+                return
 
             n = data.get("n_total", data.get("n_inliers", 0))
             self._transform = {

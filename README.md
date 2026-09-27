@@ -102,7 +102,7 @@ In matrix form as a 4x4 homogeneous transform:
 ```
 
 The plugin exports this JSON automatically after every EXIF or CSV solve, to
-`<output_dir>/geo_register_plugin_data/similarity_transform.json`.
+`~/.lichtfeld/data/plugin_data/geo_register_pluggin/<project-key>/similarity_transform.json`.
 
 ---
 
@@ -134,7 +134,7 @@ DJI_0004.JPG,32.08181023,34.78951034,48.802
 - `alt` — ellipsoidal altitude in metres
 
 The plugin exports this CSV automatically after every EXIF solve, to
-`<output_dir>/geo_register_plugin_data/image_positions.csv`.
+`~/.lichtfeld/data/plugin_data/geo_register_pluggin/<project-key>/image_positions.csv`.
 
 ---
 
@@ -237,13 +237,19 @@ the same solver as the CSV modes.
 
 ## Output Files
 
-After a successful solve the plugin writes to `<output_dir>/geo_register_plugin_data/`:
+After a successful solve the plugin writes to `~/.lichtfeld/data/plugin_data/geo_register_pluggin/<project-key>/`:
 
 | File | Description |
 |---|---|
 | `similarity_transform.json` | The solved transform (scale, R, t, RMSE, inlier counts) |
 | `similarity_transform_info.txt` | Human-readable explanation of the transform fields |
 | `image_positions.csv` | GPS positions of all matched images (EXIF and CSV modes) |
+
+`<project-key>` is the LichtFeld project file name plus the first 8 characters of the
+project UUID (e.g. `dji-5_367c7181`), so each project keeps its own registration. The UUID
+survives saves, renames and Save As, and a project reopened without its dataset still finds
+its transform. Unsaved projects use `untitled_<uuid>`. The JSON also records the full
+`project_uuid`; a file whose UUID does not match the open project is ignored.
 
 ---
 
@@ -406,4 +412,4 @@ convert any 3DGS PLY file to a geo-referenced export format without reloading th
 
 The similarity JSON format is the same as described in the [Similarity File](#2-similarity-file)
 source mode section above. The plugin exports this file automatically to
-`<output_dir>/geo_register_plugin_data/similarity_transform.json` after every successful solve.
+`~/.lichtfeld/data/plugin_data/geo_register_pluggin/<project-key>/similarity_transform.json` after every successful solve.
