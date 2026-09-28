@@ -205,32 +205,57 @@ def _build_tileset(sim: dict, positions: np.ndarray, content_uri: str,
     (4×4, model-local → scene-world) is baked into the tile matrix when
     supplied, so the renderer applies the full chain uniformly.
     """
+    pmin = positions.min(axis=0)
+    pmax = positions.max(axis=0)
+    geom_err = float(np.linalg.norm(pmax - pmin))
+
+    return {
+        **tileset_header(),
+        "geometricError": geom_err,
+        "root": {
+            "transform": root_transform(sim, world_transform),
+            "boundingVolume": {"box": aabb_box(pmin, pmax)},
+            "geometricError": geom_err,
+            "refine": "REPLACE",
+            "content": {"uri": content_uri},
+        },
+    }
+
+
+def root_transform(sim: dict, world_transform: np.ndarray | None = None) -> list:
+    """Column-major root tile matrix: sim @ diag(1,-1,-1) [@ W].
+
+    The similarity maps the viewer frame (dataset y/z flipped) to ECEF, so
+    dataset-frame positions get the flip first. Children inherit it.
+    """
     s = float(sim["scale"])
     R = np.array(sim["rotation"], dtype=np.float64).reshape(3, 3)
     t = np.array(sim["translation"], dtype=np.float64)
 
-    # M = sim @ diag(1,-1,-1) [@ W]  — all applied by the renderer uniformly.
     M = np.eye(4, dtype=np.float64)
     M[:3, :3] = s * R
     M[:3, 3] = t
     M = M @ np.diag([1.0, -1.0, -1.0, 1.0])
     if world_transform is not None:
         M = M @ world_transform
+    return M.T.flatten().tolist()
 
-    transform_col_major = M.T.flatten().tolist()
 
-    pmin = positions.min(axis=0)
-    pmax = positions.max(axis=0)
+def aabb_box(pmin, pmax) -> list:
+    """3D Tiles oriented-box array for an axis-aligned box."""
+    pmin, pmax = np.asarray(pmin), np.asarray(pmax)
     center = (pmin + pmax) * 0.5
-    half   = (pmax - pmin) * 0.5
-    box = [
+    half = (pmax - pmin) * 0.5
+    return [
         float(center[0]), float(center[1]), float(center[2]),
         float(half[0]), 0.0, 0.0,
         0.0, float(half[1]), 0.0,
         0.0, 0.0, float(half[2]),
     ]
-    geom_err = float(np.linalg.norm(pmax - pmin))
 
+
+def tileset_header() -> dict:
+    """Asset and extension declarations shared by every splat tileset."""
     return {
         "asset": {"version": "1.1"},
         "extensionsUsed": ["3DTILES_content_gltf"],
@@ -246,14 +271,6 @@ def _build_tileset(sim: dict, positions: np.ndarray, content_uri: str,
                     "KHR_gaussian_splatting_compression_spz_2",
                 ],
             }
-        },
-        "geometricError": geom_err,
-        "root": {
-            "transform": transform_col_major,
-            "boundingVolume": {"box": box},
-            "geometricError": geom_err,
-            "refine": "REPLACE",
-            "content": {"uri": content_uri},
         },
     }
 
@@ -279,6 +296,29 @@ def _export_from_arrays(
             progress_cb(f)
 
     positions = positions_local.astype(np.float32)
+    prog(0.2)
+    write_splat_glb(out_dir / content_name, positions, rotations_wxyz, scales_log,
+                    opacity_logit, f_dc, f_rest_rgb, sh_degree)
+    prog(0.8)
+
+    tileset = _build_tileset(transform, positions, content_name, world_transform)
+    with open(out_dir / "tileset.json", "w", encoding="utf-8") as f:
+        json.dump(tileset, f, indent=2)
+    prog(1.0)
+
+
+def write_splat_glb(
+    glb_path:       Path,
+    positions:      np.ndarray,          # (N, 3) tile-local space
+    rotations_wxyz: np.ndarray | None,   # (N, 4) quaternion wxyz (None → identity)
+    scales_log:     np.ndarray,          # (N, 3) log-space scales
+    opacity_logit:  np.ndarray,          # (N,) raw 3DGS logit
+    f_dc:           np.ndarray,          # (N, 3) raw SH0 coefficients
+    f_rest_rgb:     np.ndarray | None,   # (N, K, 3) or None
+    sh_degree:      int,
+) -> None:
+    """Encode splats as one SPZ-compressed KHR_gaussian_splatting GLB."""
+    positions = positions.astype(np.float32)
 
     if rotations_wxyz is None:
         n = len(positions)
@@ -292,8 +332,6 @@ def _export_from_arrays(
     norms = np.linalg.norm(rotations_xyzw, axis=-1, keepdims=True)
     norms[norms == 0] = 1.0
     rotations_xyzw /= norms
-
-    prog(0.2)
 
     # SPZ v3 stores positions as 24-bit signed fixed-point. With the default
     # fractional_bits=12 the representable range is only ±2048 m, so any scene
@@ -326,17 +364,8 @@ def _export_from_arrays(
         sh_degree=sh_degree,
         fractional_bits=frac_bits,
     )
-    prog(0.55)
-
-    glb_path = out_dir / content_name
-    _write_spz_glb(glb_path, spz, int(len(positions)), sh_degree,
+    _write_spz_glb(Path(glb_path), spz, int(len(positions)), sh_degree,
                    pos_centered, center=center)
-    prog(0.8)
-
-    tileset = _build_tileset(transform, positions, content_name, world_transform)
-    with open(out_dir / "tileset.json", "w", encoding="utf-8") as f:
-        json.dump(tileset, f, indent=2)
-    prog(1.0)
 
 
 # ─── LFS node API entry point ─────────────────────────────────────────────────

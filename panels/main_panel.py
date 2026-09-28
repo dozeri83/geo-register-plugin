@@ -108,6 +108,25 @@ def _plugin_data_dir() -> Path | None:
     return _plugin_root_dir() / key if key else None
 
 
+def _existing_outputs(out_dir, lod: bool) -> list[str]:
+    """3D Tiles outputs that already exist in out_dir; an export would overwrite them."""
+    if not out_dir:
+        return []
+    names = ("tileset.json", "tiles") if lod else ("tileset.json", "splats.glb")
+    return [name for name in names if (Path(out_dir) / name).exists()]
+
+
+def _draw_output_conflict(layout, theme, conflicts: list[str], just_exported: bool) -> None:
+    """Replaces the Export button while the output directory holds export files."""
+    # Files from the export that just succeeded: its success line says enough.
+    if not just_exported:
+        layout.text_colored(
+            f"[!] Already in this directory: {', '.join(conflicts)}. "
+            "Choose another directory or remove them.",
+            (1.0, 0.4, 0.4, 1.0),
+        )
+
+
 def _geo_draw_handler(ctx) -> None:
     pos = _active_world_pos
     if pos is None:
@@ -155,6 +174,12 @@ class MainPanel(lf.ui.Panel):
         self._tiles_success: str | None      = None
         self._tiles_max_sh: int              = 3
         self._tiles_sh_info: tuple | None    = None   # (detected, user_bound, output)
+        # Level-of-detail 3D Tiles (temporary SSOG -> tileset)
+        from ..geo.lod_tiles import LodTilesOptions
+        self._tiles_lod: bool                = True
+        self._lod_opts                       = LodTilesOptions()
+        self._tiles_stage: str | None        = None   # e.g. "2/3 Converting to 3D Tiles: ..."
+        self._tiles_cancel: bool             = False
         # PLY converter (Edit Mode)
         self._ply_file_path: str | None      = None
         self._ply_sim_path: str | None       = None
@@ -166,6 +191,9 @@ class MainPanel(lf.ui.Panel):
         self._ply_success: str | None        = None
         self._ply_max_sh: int                = 3
         self._ply_sh_info: tuple | None      = None   # (detected, user_bound, output)
+        self._ply_lod: bool                  = True   # LOD tileset; shares self._lod_opts
+        self._ply_stage: str | None          = None
+        self._ply_cancel: bool               = False
 
     @property
     def _mode(self) -> str:
@@ -194,9 +222,11 @@ class MainPanel(lf.ui.Panel):
         self._tiles_progress      = None
         self._tiles_error         = None
         self._tiles_success       = None
+        self._tiles_stage         = None
         self._ply_progress        = None
         self._ply_error           = None
         self._ply_success         = None
+        self._ply_stage           = None
         self._clear_point()
         if doc is not None:
             self._detect_existing_registration()
@@ -224,9 +254,14 @@ class MainPanel(lf.ui.Panel):
                         layout.text_colored(prefix + self._status, color)
                     self._draw_transform_section(layout, scale, theme)
                     self._draw_export_section(layout, scale, theme)
-                    layout.separator()
-                    layout.spacing()
-                self._draw_ply_converter_section(layout, scale, theme)
+                else:
+                    layout.text_colored(
+                        "No scene with cameras is loaded, so a geo reference cannot be computed.",
+                        (1.0, 0.75, 0.2, 1.0),
+                    )
+                # Without a registration the converter is all this mode offers.
+                self._draw_ply_converter_section(layout, scale, theme,
+                                                 default_open=self._transform is None)
                 return
 
         layout.label("Detect / Add Geo Reference")
@@ -266,6 +301,8 @@ class MainPanel(lf.ui.Panel):
         if self._transform is not None:
             self._draw_transform_section(layout, scale, theme)
             self._draw_export_section(layout, scale, theme)
+
+        self._draw_ply_converter_section(layout, scale, theme)
 
     def _draw_exif_section(self, layout, scale, theme):
         layout.text_colored(
@@ -862,28 +899,93 @@ class MainPanel(lf.ui.Panel):
             layout.spacing()
 
         if self._tiles_progress is not None:
+            if self._tiles_stage:
+                layout.text_colored(self._tiles_stage, (0.55, 0.8, 1.0, 1.0))
             pct = int(self._tiles_progress * 100)
             layout.progress_bar(self._tiles_progress, overlay=f"Exporting... {pct}%",
                                 width=-1, height=24 * scale)
+            if self._tiles_lod and not self._tiles_cancel:
+                if layout.button_styled("Cancel##tiles_cancel", "error", (-1, 0)):
+                    self._tiles_cancel = True
+                    self._tiles_stage = "Cancelling..."
+            elif self._tiles_cancel:
+                layout.text_colored("Cancelling...", theme.palette.text_dim)
         else:
             if self._tiles_error:
                 layout.text_colored(f"[!] {self._tiles_error}", (1.0, 0.4, 0.4, 1.0))
             if self._tiles_success:
                 layout.text_colored(self._tiles_success, (0.3, 1.0, 0.3, 1.0))
-            if splat_names and self._tiles_out_dir:
-                layout.label("Max SH:")
-                layout.same_line()
-                sh_changed, sh_idx = layout.combo(
-                    "##tiles_max_sh", 3 - self._tiles_max_sh, ["3", "2", "1", "0"]
-                )
-                if sh_changed:
-                    self._tiles_max_sh = 3 - sh_idx
-                layout.spacing()
-                if layout.button_styled("Export 3D Tiles##export_tiles_btn", "primary", (-1, 32 * scale)):
-                    self._start_export_tiles()
-                    lf.ui.request_redraw()
-            elif not splat_names:
+            if not splat_names:
                 layout.text_colored("No splat models found in scene.", theme.palette.text_dim)
+                return
+            # Options first; only the export itself needs an output directory.
+            layout.label("Max SH:")
+            layout.same_line()
+            sh_changed, sh_idx = layout.combo(
+                "##tiles_max_sh", 3 - self._tiles_max_sh, ["3", "2", "1", "0"]
+            )
+            if sh_changed:
+                self._tiles_max_sh = 3 - sh_idx
+            lod_changed, lod = layout.checkbox("Level of detail (LOD)##tiles_lod", self._tiles_lod)
+            if lod_changed:
+                self._tiles_lod = lod
+            if self._tiles_lod:
+                self._draw_lod_settings(layout, scale, theme)
+            else:
+                layout.text_colored("Single tile: the whole model in one GLB.", theme.palette.text_dim)
+            # Keep Export well apart from the LOD "Reset to defaults" button.
+            layout.spacing()
+            layout.separator()
+            layout.spacing()
+            conflicts = _existing_outputs(self._tiles_out_dir, self._tiles_lod)
+            if not self._tiles_out_dir:
+                layout.text_colored("Choose an output directory to export.", theme.palette.text_dim)
+            elif conflicts:
+                # Shown in place of the Export button, so nothing is overwritten.
+                _draw_output_conflict(layout, theme, conflicts, just_exported=bool(self._tiles_success))
+            elif layout.button_styled("Export 3D Tiles##export_tiles_btn", "primary", (-1, 32 * scale)):
+                self._start_export_tiles()
+                lf.ui.request_redraw()
+
+    def _draw_lod_settings(self, layout, scale, theme) -> None:
+        """Editable LOD 3D Tiles parameters, collapsed by default."""
+        opts = self._lod_opts
+        if not layout.collapsing_header("LOD settings##lod_settings", True):
+            levels = "auto" if opts.lod_levels == 0 else str(opts.lod_levels)
+            layout.text_colored(
+                f"{opts.chunk_count_k}k splats/chunk, error x{opts.error_scale:g}, {levels} levels",
+                theme.palette.text_dim,
+            )
+            return
+        dim = theme.palette.text_dim
+
+        layout.text_colored("3D Tiles", dim)
+        ch, v = layout.input_float("Error scale##lod_err", opts.error_scale, 1.0, 4.0, "%.1f")
+        if ch:
+            opts.error_scale = max(0.1, min(1000.0, v))
+
+        layout.text_colored("LOD levels (temporary SSOG)", dim)
+        ch, idx = layout.combo("Levels##lod_levels", opts.lod_levels,
+                               ["Auto"] + [str(i) for i in range(1, 9)])
+        if ch:
+            opts.lod_levels = idx
+        ch, v = layout.input_float("Level ratio##lod_ratio", opts.lod_ratio, 0.05, 0.1, "%.2f")
+        if ch:
+            opts.lod_ratio = max(0.1, min(0.9, v))
+
+        layout.text_colored("Chunks (temporary SSOG; chunk splats is also the tile budget)", dim)
+        ch, v = layout.input_int("Chunk splats (K)##lod_chunk_k", opts.chunk_count_k, 10, 100)
+        if ch:
+            opts.chunk_count_k = max(1, min(2048, v))
+        ch, v = layout.input_float("Chunk extent (m)##lod_chunk_m", opts.chunk_extent_m, 1.0, 8.0, "%.1f")
+        if ch:
+            opts.chunk_extent_m = max(0.5, min(1000.0, v))
+        ch, v = layout.input_int("Min chunk splats (K)##lod_chunk_min", opts.chunk_min_k, 1, 8)
+        if ch:
+            opts.chunk_min_k = max(0, min(1024, v))
+
+        if layout.button_styled("Reset to defaults##lod_reset", "warning", (-1, 0)):
+            opts.reset()
 
     def _get_splat_names(self) -> list[str]:
         import lichtfeld.scene as lf_scene
@@ -952,17 +1054,19 @@ class MainPanel(lf.ui.Panel):
         import threading
         import lichtfeld.scene as lf_scene
 
+        import dataclasses
+
         out_dir = Path(self._tiles_out_dir)
 
-        # Conflict check
-        for fname in ("tileset.json", "splats.glb"):
-            if (out_dir / fname).exists():
-                self._tiles_error = (
-                    f"{fname} already exists in the selected directory. "
-                    "Please choose a different directory."
-                )
-                lf.ui.request_redraw()
-                return
+        # Conflict check (the panel already hides Export; files may appear since)
+        conflicts = _existing_outputs(out_dir, self._tiles_lod)
+        if conflicts:
+            self._tiles_error = (
+                f"{', '.join(conflicts)} already exists in the selected directory. "
+                "Please choose a different directory."
+            )
+            lf.ui.request_redraw()
+            return
 
         scene = lf.get_scene()
         if scene is None:
@@ -979,7 +1083,18 @@ class MainPanel(lf.ui.Panel):
         self._tiles_error    = None
         self._tiles_success  = None
         self._tiles_sh_info  = None
+        self._tiles_stage    = None
+        self._tiles_cancel   = False
         lf.ui.request_redraw()
+
+        if self._tiles_lod:
+            options = dataclasses.replace(self._lod_opts, max_sh_degree=self._tiles_max_sh)
+            threading.Thread(
+                target=self._export_tiles_lod_worker,
+                args=(node, dict(self._transform), str(out_dir), options),
+                daemon=True,
+            ).start()
+            return
 
         threading.Thread(
             target=self._export_tiles_worker,
@@ -987,9 +1102,59 @@ class MainPanel(lf.ui.Panel):
             daemon=True,
         ).start()
 
-    def _on_tiles_progress(self, fraction: float) -> None:
+    def _on_tiles_progress(self, fraction: float) -> bool:
         self._tiles_progress = fraction
         lf.ui.request_redraw()
+        return not self._tiles_cancel
+
+    def _on_tiles_stage(self, index: int, count: int, message: str) -> None:
+        self._tiles_stage = f"Step {index + 1}/{count}: {message}"
+        lf.log.info(f"geo_register: 3D Tiles {self._tiles_stage}")
+        lf.ui.request_redraw()
+
+    def _export_tiles_lod_worker(self, node, transform: dict, out_dir: str, options) -> None:
+        import numpy as np
+        from ..geo.lod_tiles import export_lod_3dtiles
+        from ..geo.ssog_tiles import ExportCancelled
+        from ..geo.tiles_exporter import DIM_FOR_DEGREE
+
+        try:
+            splat_data = node.splat_data()
+            if splat_data is None:
+                raise RuntimeError("Selected node has no splat data.")
+            try:
+                sh_raw = splat_data.shN_raw
+                k = int(sh_raw.shape[1]) if sh_raw.ndim == 3 else 0
+                actual_sh = max(d for d in range(4) if DIM_FOR_DEGREE[d] <= k)
+            except Exception:
+                actual_sh = 3
+            self._tiles_sh_info = (actual_sh, options.max_sh_degree, min(options.max_sh_degree, actual_sh))
+
+            summary = export_lod_3dtiles(
+                splat_data, transform, out_dir,
+                work_root=_plugin_root_dir() / "tmp",
+                options=options,
+                world_transform=np.asarray(node.world_transform, dtype=np.float64).reshape(4, 4),
+                on_stage=self._on_tiles_stage,
+                on_progress=self._on_tiles_progress,
+                log=lambda m: lf.log.info(f"geo_register: {m}"),
+            )
+            minutes, seconds = divmod(int(summary["seconds"]), 60)
+            self._tiles_success = (
+                f"Export succeeded: {summary['tiles']} tiles, {summary['lod_levels']} LOD levels, "
+                f"{summary['bytes'] / 2**30:.2f} GiB in {minutes}:{seconds:02d}"
+            )
+            lf.log.info(f"geo_register: {self._tiles_success} -> '{out_dir}'")
+        except ExportCancelled:
+            self._tiles_error = "Export cancelled."
+            lf.log.warn("geo_register: 3D Tiles export cancelled")
+        except Exception as exc:
+            self._tiles_error = "Export cancelled." if self._tiles_cancel else str(exc)
+            lf.log.error(f"geo_register: 3D Tiles export failed: {exc}")
+        finally:
+            self._tiles_progress = None
+            self._tiles_stage = None
+            lf.ui.request_redraw()
 
     def _export_tiles_worker(self, node, transform: dict, out_dir: str, max_sh: int = 3) -> None:
         try:
@@ -1018,20 +1183,20 @@ class MainPanel(lf.ui.Panel):
             self._tiles_progress = None
             lf.ui.request_redraw()
 
-    # ── PLY Converter (Edit Mode) ─────────────────────────────────────────────
+    # ── PLY Converter (all modes) ─────────────────────────────────────────────
 
-    def _draw_ply_converter_section(self, layout, scale, theme) -> None:
-        layout.label("PLY → Geo Export")
+    def _draw_ply_converter_section(self, layout, scale, theme, default_open: bool = False) -> None:
+        # A registration found for this project replaces the similarity JSON.
+        use_saved = self._transform is not None
         layout.separator()
-        layout.text_colored(
-            "Geo Registration Plugin cannot align — no scene was detected.\n\n"
-            "You can still convert a splat PLY file using a pre-calculated\n"
-            "similarity matrix. Note: the similarity matrix must be calculated\n"
-            "while a scene is still loaded in LichtFeld Studio.",
-            (1.0, 0.75, 0.2, 1.0),
-        )
-        layout.spacing()
-        layout.separator()
+        if not layout.collapsing_header("Convert external PLY##ply_converter", default_open):
+            return
+        if not use_saved:
+            layout.text_colored(
+                "Converts a splat PLY file using a similarity JSON saved\n"
+                "earlier by this plugin (computed while the scene was loaded).",
+                theme.palette.text_dim,
+            )
         layout.spacing()
 
         # PLY file
@@ -1048,17 +1213,20 @@ class MainPanel(lf.ui.Panel):
         layout.spacing()
 
         # Similarity JSON
-        layout.label("Similarity Transform JSON:")
-        if self._ply_sim_path:
-            layout.text_colored(Path(self._ply_sim_path).name, theme.palette.text_dim)
-            if layout.button_styled("Change JSON##ply_sim_change", "warning", (-1, 28 * scale)):
-                self._pick_ply_sim_file()
+        if use_saved:
+            layout.text_colored("Using this project's saved registration.", theme.palette.text_dim)
         else:
-            layout.text_colored("No file selected.", theme.palette.text_dim)
-            if layout.button_styled("Pick Similarity JSON##ply_sim_pick", "primary", (-1, 32 * scale)):
-                self._pick_ply_sim_file()
+            layout.label("Similarity Transform JSON:")
+            if self._ply_sim_path:
+                layout.text_colored(Path(self._ply_sim_path).name, theme.palette.text_dim)
+                if layout.button_styled("Change JSON##ply_sim_change", "warning", (-1, 28 * scale)):
+                    self._pick_ply_sim_file()
+            else:
+                layout.text_colored("No file selected.", theme.palette.text_dim)
+                if layout.button_styled("Pick Similarity JSON##ply_sim_pick", "primary", (-1, 32 * scale)):
+                    self._pick_ply_sim_file()
 
-        inputs_ready = self._ply_file_path is not None and self._ply_sim_path is not None
+        inputs_ready = self._ply_file_path is not None and (use_saved or self._ply_sim_path is not None)
 
         if not inputs_ready:
             return
@@ -1084,6 +1252,16 @@ class MainPanel(lf.ui.Panel):
             )
             if sh_changed:
                 self._ply_max_sh = 3 - sh_idx
+            lod_changed, lod = layout.checkbox("Level of detail (LOD)##ply_lod", self._ply_lod)
+            if lod_changed:
+                self._ply_lod = lod
+            if self._ply_lod:
+                # Same settings as the scene export; own ids for the widgets.
+                layout.push_id("ply")
+                self._draw_lod_settings(layout, scale, theme)
+                layout.pop_id()
+            else:
+                layout.text_colored("Single tile: the whole model in one GLB.", theme.palette.text_dim)
 
         layout.spacing()
 
@@ -1114,9 +1292,15 @@ class MainPanel(lf.ui.Panel):
             layout.spacing()
 
         if self._ply_progress is not None:
+            if self._ply_stage:
+                layout.text_colored(self._ply_stage, (0.55, 0.8, 1.0, 1.0))
             pct = int(self._ply_progress * 100)
             layout.progress_bar(self._ply_progress, overlay=f"Exporting... {pct}%",
                                 width=-1, height=24 * scale)
+            if self._ply_stage is not None and not self._ply_cancel:
+                if layout.button_styled("Cancel##ply_cancel", "error", (-1, 0)):
+                    self._ply_cancel = True
+                    self._ply_stage = "Cancelling..."
         elif ready:
             if self._ply_error:
                 layout.text_colored(f"[!] {self._ply_error}", (1.0, 0.4, 0.4, 1.0))
@@ -1124,7 +1308,11 @@ class MainPanel(lf.ui.Panel):
                 layout.text_colored(self._ply_success, (0.3, 1.0, 0.3, 1.0))
             btn_label = ["Export LAS##ply_exp", "Export LAZ##ply_exp",
                          "Export 3D Tiles##ply_exp"][self._ply_format_idx]
-            if layout.button_styled(btn_label, "primary", (-1, 32 * scale)):
+            conflicts = (_existing_outputs(self._ply_out_dir, lod=self._ply_lod)
+                         if self._ply_format_idx == 2 else [])
+            if conflicts:
+                _draw_output_conflict(layout, theme, conflicts, just_exported=bool(self._ply_success))
+            elif layout.button_styled(btn_label, "primary", (-1, 32 * scale)):
                 self._start_ply_export()
                 lf.ui.request_redraw()
 
@@ -1157,10 +1345,13 @@ class MainPanel(lf.ui.Panel):
         import json
         import threading
 
-        # Load similarity transform
+        # Load similarity transform (saved registration first, else the picked JSON)
         try:
-            with open(self._ply_sim_path, "r", encoding="utf-8") as f:
-                sim_data = json.load(f)
+            if self._transform is not None:
+                sim_data = self._transform
+            else:
+                with open(self._ply_sim_path, "r", encoding="utf-8") as f:
+                    sim_data = json.load(f)
             transform = {
                 "scale":       sim_data.get("scale",       sim_data.get("s")),
                 "rotation":    sim_data.get("rotation",    sim_data.get("R")),
@@ -1194,20 +1385,32 @@ class MainPanel(lf.ui.Panel):
         else:
             # 3D Tiles: conflict check
             out_dir = Path(self._ply_out_dir)
-            for fname in ("tileset.json", "splats.glb"):
-                if (out_dir / fname).exists():
-                    self._ply_error = (
-                        f"{fname} already exists. Please choose a different directory."
-                    )
-                    lf.ui.request_redraw()
-                    return
+            conflicts = _existing_outputs(out_dir, lod=self._ply_lod)
+            if conflicts:
+                self._ply_error = (
+                    f"{', '.join(conflicts)} already exists. Please choose a different directory."
+                )
+                lf.ui.request_redraw()
+                return
             out_path = str(out_dir)
 
         self._ply_progress = 0.0
         self._ply_error    = None
         self._ply_success  = None
         self._ply_sh_info  = None
+        self._ply_stage    = None
+        self._ply_cancel   = False
         lf.ui.request_redraw()
+
+        if self._ply_format_idx == 2 and self._ply_lod:
+            import dataclasses
+            options = dataclasses.replace(self._lod_opts, max_sh_degree=self._ply_max_sh)
+            threading.Thread(
+                target=self._ply_export_lod_worker,
+                args=(self._ply_file_path, transform, out_path, options),
+                daemon=True,
+            ).start()
+            return
 
         threading.Thread(
             target=self._ply_export_worker,
@@ -1262,9 +1465,64 @@ class MainPanel(lf.ui.Panel):
             self._ply_progress = None
             lf.ui.request_redraw()
 
-    def _on_ply_progress(self, fraction: float) -> None:
+    def _ply_export_lod_worker(self, ply_path: str, transform: dict, out_dir: str, options) -> None:
+        from ..geo.lod_tiles import export_lod_3dtiles
+        from ..geo.ssog_tiles import ExportCancelled
+        from ..geo.tiles_exporter import DIM_FOR_DEGREE
+
+        splat_data = None
+        try:
+            # The PLY is in the dataset frame the similarity was computed for.
+            self._ply_stage = f"Loading {Path(ply_path).name}..."
+            lf.ui.request_redraw()
+            splat_data = lf.io.load(ply_path).splat_data
+            if splat_data is None:
+                raise RuntimeError("The PLY file holds no splats.")
+            if self._ply_cancel:
+                raise ExportCancelled("cancelled while loading the PLY")
+            try:
+                sh_raw = splat_data.shN_raw
+                k = int(sh_raw.shape[1]) if sh_raw.ndim == 3 else 0
+                actual_sh = max(d for d in range(4) if DIM_FOR_DEGREE[d] <= k)
+            except Exception:
+                actual_sh = 3
+            self._ply_sh_info = (actual_sh, options.max_sh_degree, min(options.max_sh_degree, actual_sh))
+
+            summary = export_lod_3dtiles(
+                splat_data, transform, out_dir,
+                work_root=_plugin_root_dir() / "tmp",
+                options=options,
+                on_stage=self._on_ply_stage,
+                on_progress=self._on_ply_progress,
+                log=lambda m: lf.log.info(f"geo_register: {m}"),
+            )
+            minutes, seconds = divmod(int(summary["seconds"]), 60)
+            self._ply_success = (
+                f"Export succeeded: {summary['tiles']} tiles, {summary['lod_levels']} LOD levels, "
+                f"{summary['bytes'] / 2**30:.2f} GiB in {minutes}:{seconds:02d}"
+            )
+            lf.log.info(f"geo_register: PLY {self._ply_success} -> '{out_dir}'")
+        except ExportCancelled:
+            self._ply_error = "Export cancelled."
+            lf.log.warn("geo_register: PLY 3D Tiles export cancelled")
+        except Exception as exc:
+            self._ply_error = "Export cancelled." if self._ply_cancel else str(exc)
+            lf.log.error(f"geo_register: PLY 3D Tiles export failed: {exc}")
+        finally:
+            del splat_data  # release the loaded model's memory
+            self._ply_progress = None
+            self._ply_stage = None
+            lf.ui.request_redraw()
+
+    def _on_ply_stage(self, index: int, count: int, message: str) -> None:
+        self._ply_stage = f"Step {index + 1}/{count}: {message}"
+        lf.log.info(f"geo_register: PLY 3D Tiles {self._ply_stage}")
+        lf.ui.request_redraw()
+
+    def _on_ply_progress(self, fraction: float) -> bool:
         self._ply_progress = fraction
         lf.ui.request_redraw()
+        return not self._ply_cancel
 
     def _detect_existing_registration(self) -> None:
         import json
