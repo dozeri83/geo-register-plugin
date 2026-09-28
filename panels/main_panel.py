@@ -958,6 +958,7 @@ class MainPanel(lf.ui.Panel):
             )
             return
         dim = theme.palette.text_dim
+        layout.text_colored("See the plugin README (3D Tiles > LOD tileset) for details.", dim)
 
         layout.text_colored("3D Tiles", dim)
         ch, v = layout.input_float("Error scale##lod_err", opts.error_scale, 1.0, 4.0, "%.1f")

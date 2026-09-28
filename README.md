@@ -3,7 +3,8 @@
 Registers a [LichtFeld Studio](https://github.com/MrNeRF/LichtFeld-Studio/) scene to real-world geographic coordinates (WGS-84 / ECEF).
 Once registered, clicking any point on the model returns its latitude, longitude, and altitude.
 The plugin can also export geo-referenced splat models as **LAS/LAZ** point clouds or
-**3D Tiles 1.1** datasets (ArcGIS Gaussian Splat Layer / CesiumJS).
+**3D Tiles 1.1** datasets (ArcGIS Gaussian Splat Layer / CesiumJS), including tiled
+level-of-detail (LOD) tilesets for large models.
 
 ![Geo Register Plugin in action](assets/plugin_example.jpg)
 
@@ -288,13 +289,19 @@ the defaults below are used when a key is absent or the file does not exist.
 
 ## Export
 
-Once geo-registration is complete, the plugin can export any splat model visible in the
-scene as a geo-referenced point cloud file.
+Once geo-registration is complete (or a registration saved for the project is found),
+the plugin can export any splat model in the scene as a geo-referenced LAS/LAZ point
+cloud or 3D Tiles dataset. To convert a splat PLY file that is not in the scene, see
+[Convert External PLY](#convert-external-ply).
 
-The export section appears at the bottom of the panel. Use the **Splat Model** dropdown
-to select which model to export, choose the output format, then click **Export LAS/LAZ**.
-A save dialog opens with the splat name pre-filled as the filename. The last exported
-path is shown in the panel for reference.
+The **Export** section appears below the transform. Use the **Splat Model** dropdown
+to select which model to export and choose the output **Format**:
+
+- **LAS / LAZ** — click **Export LAS/LAZ**. A save dialog opens with the splat name
+  pre-filled as the filename; it asks before overwriting an existing file. The last
+  exported path is shown in the panel for reference.
+- **3D Tiles (SPZ)** — choose the options, pick an output directory, then click
+  **Export 3D Tiles** (see [3D Tiles](#3d-tiles)).
 
 ### LAS — LASer file format
 
@@ -340,7 +347,95 @@ identical to LAS; only the storage is compressed using the
 ![3D Tiles export in ArcGIS](assets/3dtiles_example.png)
 
 The plugin can export the splat model as a georeferenced **3D Tiles 1.1** dataset
-that renders as full Gaussian splats (not a point cloud).
+that renders as full Gaussian splats (not a point cloud). Two layouts are available,
+selected with the **Level of detail (LOD)** checkbox:
+
+| Mode | Output | Use for |
+|---|---|---|
+| **LOD** *(default)* | Many tiles in a coarse-to-fine hierarchy | Large models — viewers stream only the tiles and detail the camera needs |
+| **Single tile** | The whole model in one GLB | Small models |
+
+**Max SH** caps the spherical-harmonics degree written to the tiles (lower = smaller
+files, less view-dependent colour).
+
+In both modes the root tile's `transform` holds the similarity transform (scene → ECEF,
+including the splat node's own transform), placing the model at the correct position on
+Earth; all tiles below inherit it.
+
+#### LOD tileset
+
+**Output files:**
+
+```
+out_dir/
+  tileset.json          # 3D Tiles 1.1 manifest (tile tree, bounds, geometric errors)
+  tiles/
+    L0/000123.glb       # full-detail tiles
+    L1/...              # each level holds about half the splats of the level below
+    ...
+    L<n>/...            # coarsest level, loaded first
+```
+
+**How it is built** — the panel shows the current step, a progress bar and a
+**Cancel** button:
+
+1. **Exporting temporary SSOG** — LichtFeld Studio (`lf.io.save_ssog`) builds the LOD
+   levels by merging splats and splits the scene into spatial chunks (a k-d tree).
+2. **Converting to 3D Tiles** — each tile is one tree node at one LOD level. Parents
+   and children cover the same region with `REPLACE` refinement, so zooming in swaps a
+   coarse tile for finer ones without gaps or double drawing. A tile's
+   `geometricError` is the median splat diameter of its content, times the error scale.
+3. **Removing temporary files** — the temporary SSOG is always deleted, also after a
+   cancelled or failed export. A failed or cancelled export also removes the partial
+   `tileset.json` and `tiles/` it created.
+
+The temporary SSOG is written to `~/.lichtfeld/data/plugin_data/geo_register_pluggin/tmp/`.
+
+**LOD settings** (collapsible; **Reset to defaults** restores them):
+
+| Setting | Default | Description |
+|---|---|---|
+| Error scale | `16` | Multiplies every tile's geometric error (see [Screen-space error](#screen-space-error-sse) below). Higher switches to finer tiles sooner (sharper, more memory); lower keeps coarse tiles longer |
+| Levels | `Auto` | Number of LOD levels (1–8). Auto picks enough levels for the coarsest one to hold about 1M splats |
+| Level ratio | `0.5` | Fraction of splats each coarser level keeps |
+| Chunk splats (K) | `100` | Maximum splats per chunk, in thousands, summed over all levels. Also the tile budget: no tile holds more than this many splats |
+| Chunk extent (m) | `16` | Chunks larger than this (in metres) are split further, unless they are below Min chunk splats |
+| Min chunk splats (K) | `8` | Chunks with fewer splats are not split for their extent |
+
+##### Screen-space error (SSE)
+
+3D Tiles viewers decide which level to draw from each tile's `geometricError` (in
+metres): the detail the tile lacks compared to its children. They project it to pixels,
+
+```
+SSE = geometricError × screen_height_px / (2 × distance × tan(fov / 2))
+```
+
+and refine the tile (replace it with its children) when the SSE exceeds the viewer's
+maximum screen-space error, typically **16 px** (Cesium's `maximumScreenSpaceError`;
+ArcGIS behaves similarly).
+
+The plugin sets each tile's base error to the **median splat diameter** of its content
+and multiplies it by the **error scale**. With the default scale of 16, a tile refines
+once its typical splat would cover about **1 px** (16 px ÷ 16): coarse splats are
+swapped for finer ones before they become visible as blobs. Doubling the scale
+refines at twice the distance (sharper, more tiles in memory); halving it keeps coarse
+levels up to twice as close.
+
+##### Viewer memory
+
+The defaults were tuned in ArcGIS Maps SDK 5.0. Web viewers have a fixed Gaussian splat
+memory budget that does not depend on your GPU: ArcGIS logs
+`ran out of gaussian splat memory` and stops drawing the layer when it is exceeded.
+The coarsest level must fit in that budget because it is loaded first, so keep
+**Levels** on **Auto**: fewer levels than Auto can produce a tileset that flashes and
+disappears. For ArcGIS, `quality-profile="high"` on the scene raises the budget.
+
+> **Tip:** splats floating far from the scene (common in drone captures) inflate the
+> tileset's extent and make viewers zoom far out. Remove them before exporting, e.g.
+> with LichtFeld Studio's **Crop Box** (**Fit Trim**, then **Apply**).
+
+#### Single tile
 
 **Output files:**
 
@@ -350,19 +445,15 @@ out_dir/
   splats.glb     # Binary glTF — SPZ-compressed splat data in the BIN chunk
 ```
 
-**Tileset structure:**
+The root tile holds the transform and `splats.glb` as its content.
 
-```
-root  (no transform — ECEF bounding volume only)
-└── child  (similarity transform: local → ECEF)
-      └── content: splats.glb
-```
+#### Existing files
 
-The similarity transform computed by the geo-registration is embedded directly
-as the child tile's `transform`, placing the splat cloud at the correct ECEF
-position on Earth.
+The export never overwrites: if the chosen directory already contains `tileset.json`
+and `tiles/` (LOD) or `splats.glb` (single tile), the **Export** button is replaced
+by an error until you pick another directory or remove the files.
 
-**Format details:**
+#### Format details
 
 | Property | Value |
 |---|---|
@@ -388,28 +479,55 @@ the Niantic reference byte-for-byte.
 
 ---
 
-## No Scene Plugin Functionality
+## Edit Mode (No Cameras)
 
-When LichtFeld Studio is in **Edit Mode** (no scene loaded), geo-registration is not
-possible because there are no camera poses to fit the similarity transform against.
+When LichtFeld Studio is in **Edit Mode** (no cameras loaded), geo-registration cannot
+be computed because there are no camera poses to fit the similarity transform against.
 
-However, the plugin remains useful: if you already have a **pre-calculated similarity
-matrix** (computed during a previous session while a scene was loaded), you can still
-convert any 3DGS PLY file to a geo-referenced export format without reloading the scene.
+If a registration was saved for the open project (see [Output Files](#output-files)),
+the plugin finds it and still offers the transform display, **Get Pixel Location** and
+the full [Export](#export) section for the project's splat models. Otherwise it shows
+a note and opens [Convert External PLY](#convert-external-ply).
+
+---
+
+## Convert External PLY
+
+The collapsible **Convert external PLY** section at the bottom of the panel, available
+in every mode, converts a 3DGS `.ply` file that is not loaded in the scene to LAS, LAZ
+or 3D Tiles.
+
+The PLY must be in the same coordinate frame the similarity transform was computed
+for, e.g. a model trained or exported from the registered LichtFeld Studio project.
+
+**Steps:**
+
+1. Expand **Convert external PLY** (it opens by itself in Edit Mode without a
+   registration).
+2. Click **Pick PLY File** and select your 3DGS `.ply` file.
+3. Similarity transform:
+   - If the open project has a registration, it is used automatically.
+   - Otherwise click **Pick Similarity JSON** and select a `similarity_transform.json`
+     saved earlier by this plugin.
+4. Choose the output **Format** and destination. For 3D Tiles, the **Max SH**,
+   **Level of detail (LOD)** and LOD settings work as described in [3D Tiles](#3d-tiles)
+   and share their values with the scene export.
+5. Click **Export**. For LOD 3D Tiles the PLY is loaded first, then the three export
+   steps run with progress and **Cancel**.
 
 > **Important:** the similarity matrix must have been calculated with a scene still
 > loaded in LichtFeld Studio. You cannot compute it in Edit Mode.
 
-**Steps:**
-
-1. Switch to **Edit Mode** in LichtFeld Studio (or open it without a scene).
-2. The Geo Register Plugin panel automatically switches to **PLY → Geo Export** mode.
-3. Click **Pick PLY File** and select your 3DGS `.ply` file.
-4. Click **Pick Similarity JSON** and select the pre-calculated `similarity_transform.json`.
-5. Once both files are selected, choose the output **Format** and export destination.
-6. Click **Export** — the plugin converts the PLY directly to the chosen format
-   (LAS, LAZ, or 3D Tiles) using the stored similarity transform.
-
 The similarity JSON format is the same as described in the [Similarity File](#2-similarity-file)
-source mode section above. The plugin exports this file automatically to
+source mode section above. The plugin writes this file automatically to
 `~/.lichtfeld/data/plugin_data/geo_register_pluggin/<project-key>/similarity_transform.json` after every successful solve.
+
+---
+
+## Requirements
+
+- LichtFeld Studio with the Python plugin API `>=1,<2`.
+- **LOD 3D Tiles** needs `lf.io.save_ssog`, and per-project storage uses
+  `lf.plugins.data_dir` / `lf.project_uuid` / `lf.project_path`; both are in the LichtFeld
+  Studio `dev` branch from September 2026 and in the first release after it.
+- Python packages (installed automatically): `numpy`, `Pillow`, `laspy[lazrs]`.
